@@ -1,4 +1,5 @@
-from django.core.urlresolvers import reverse
+from __future__ import absolute_import
+
 from sentry.testutils import APITestCase
 
 
@@ -10,9 +11,7 @@ class GroupEventsTest(APITestCase):
         event_1 = self.create_event('a' * 32, group=group)
         event_2 = self.create_event('b' * 32, group=group)
 
-        url = reverse('sentry-api-0-group-events', kwargs={
-            'group_id': group.id
-        })
+        url = '/api/0/issues/{}/events/'.format(group.id)
         response = self.client.get(url, format='json')
 
         assert response.status_code == 200, response.content

@@ -7,11 +7,11 @@ from sentry.models import Release
 from sentry.testutils import APITestCase
 
 
-class ProjectReleasesTest(APITestCase):
+class ProjectReleaseListTest(APITestCase):
     def test_simple(self):
         self.login_as(user=self.user)
 
-        team = self.create_team(owner=self.user)
+        team = self.create_team()
         project1 = self.create_project(team=team, name='foo')
         project2 = self.create_project(team=team, name='bar')
 
@@ -31,11 +31,107 @@ class ProjectReleasesTest(APITestCase):
         )
 
         url = reverse('sentry-api-0-project-releases', kwargs={
-            'project_id': project1.id,
+            'organization_slug': project1.organization.slug,
+            'project_slug': project1.slug,
         })
         response = self.client.get(url, format='json')
 
         assert response.status_code == 200, response.content
         assert len(response.data) == 2
-        assert response.data[0]['id'] == str(release2.id)
-        assert response.data[1]['id'] == str(release1.id)
+        assert response.data[0]['version'] == release2.version
+        assert response.data[1]['version'] == release1.version
+
+    def test_query_filter(self):
+        self.login_as(user=self.user)
+
+        team = self.create_team()
+        project = self.create_project(team=team, name='foo')
+
+        release = Release.objects.create(
+            project=project,
+            version='foobar',
+            date_added=datetime(2013, 8, 13, 3, 8, 24, 880386),
+        )
+
+        url = reverse('sentry-api-0-project-releases', kwargs={
+            'organization_slug': project.organization.slug,
+            'project_slug': project.slug,
+        })
+        response = self.client.get(url + '?query=foo', format='json')
+
+        assert response.status_code == 200, response.content
+        assert len(response.data) == 1
+        assert response.data[0]['version'] == release.version
+
+        response = self.client.get(url + '?query=bar', format='json')
+
+        assert response.status_code == 200, response.content
+        assert len(response.data) == 0
+
+
+class ProjectReleaseCreateTest(APITestCase):
+    def test_minimal(self):
+        self.login_as(user=self.user)
+
+        team = self.create_team()
+        project = self.create_project(team=team, name='foo')
+
+        url = reverse('sentry-api-0-project-releases', kwargs={
+            'organization_slug': project.organization.slug,
+            'project_slug': project.slug,
+        })
+        response = self.client.post(url, data={
+            'version': '1.2.1',
+        })
+
+        assert response.status_code == 201, response.content
+        assert response.data['version']
+
+        release = Release.objects.get(
+            project=project,
+            version=response.data['version'],
+        )
+        assert not release.owner
+
+    def test_duplicate(self):
+        self.login_as(user=self.user)
+
+        team = self.create_team()
+        project = self.create_project(team=team, name='foo')
+
+        Release.objects.create(version='1.2.1', project=project)
+
+        url = reverse('sentry-api-0-project-releases', kwargs={
+            'organization_slug': project.organization.slug,
+            'project_slug': project.slug,
+        })
+
+        response = self.client.post(url, data={
+            'version': '1.2.1',
+        })
+
+        assert response.status_code == 400, response.content
+
+    def test_features(self):
+        self.login_as(user=self.user)
+
+        team = self.create_team()
+        project = self.create_project(team=team, name='foo')
+
+        url = reverse('sentry-api-0-project-releases', kwargs={
+            'organization_slug': project.organization.slug,
+            'project_slug': project.slug,
+        })
+        response = self.client.post(url, data={
+            'version': '1.2.1',
+            'owner': self.user.email,
+        })
+
+        assert response.status_code == 201, response.content
+        assert response.data['version']
+
+        release = Release.objects.get(
+            project=project,
+            version=response.data['version'],
+        )
+        assert release.owner == self.user

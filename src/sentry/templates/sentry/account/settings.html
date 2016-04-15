@@ -6,11 +6,14 @@
 
 {% block title %}{% trans "Account Settings" %} | {{ block.super }}{% endblock %}
 
-{% block inner %}
+{% block main %}
     <form action="" method="post">
         {% csrf_token %}
         {{ form|as_crispy_errors }}
-        {% with form.first_name as field %}
+
+        <legend style="margin-top: 0;">Your details</legend>
+
+        {% with form.name as field %}
             {{ field|as_crispy_field }}
         {% endwith %}
         {% if form.username %}

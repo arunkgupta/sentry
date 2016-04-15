@@ -8,14 +8,17 @@ sentry.web.forms.fields
 from __future__ import absolute_import
 
 import six
+from ipaddr import IPNetwork
 
+from django.core.validators import URLValidator
 from django.forms.widgets import RadioFieldRenderer, TextInput, Widget
 from django.forms.util import flatatt
 from django.forms import (
-    Field, CharField, IntegerField, TypedChoiceField, ValidationError
+    Field, CharField, IntegerField, Textarea, TypedChoiceField, ValidationError
 )
 from django.utils.encoding import force_unicode
 from django.utils.html import format_html
+from sentry.utils.http import parse_uri_match
 from django.utils.safestring import mark_safe
 from django.utils.translation import ugettext_lazy as _
 
@@ -72,7 +75,10 @@ class UserField(CharField):
         if not value:
             return None
         try:
-            return User.objects.get(username=value)
+            return User.objects.get(
+                username=value,
+                is_active=True,
+            )
         except User.DoesNotExist:
             raise ValidationError(_('Invalid username'))
 
@@ -88,7 +94,7 @@ class RangeField(IntegerField):
         attrs = super(RangeField, self).widget_attrs(widget)
         attrs.setdefault('min', self.min_value)
         attrs.setdefault('max', self.max_value)
-        attrs.setdefault('step', self.step_value)
+        attrs.setdefault('step', self.step_value or 1)
         return attrs
 
 
@@ -111,3 +117,59 @@ class ReadOnlyTextField(Field):
         # Always return initial because the widget doesn't
         # render an input field.
         return initial
+
+
+class OriginsField(CharField):
+    # Special case origins that don't fit the normal regex pattern, but are valid
+    WHITELIST_ORIGINS = ('*')
+
+    _url_validator = URLValidator()
+    widget = Textarea(
+        attrs={
+            'placeholder': mark_safe(_('e.g. example.com or https://example.com')),
+            'class': 'span8',
+        },
+    )
+
+    def clean(self, value):
+        if not value:
+            return []
+        values = filter(bool, (v.strip() for v in value.split('\n')))
+        for value in values:
+            if not self.is_valid_origin(value):
+                raise ValidationError('%r is not an acceptable value' % value)
+        return values
+
+    def is_valid_origin(self, value):
+        if value in self.WHITELIST_ORIGINS:
+            return True
+
+        bits = parse_uri_match(value)
+        # ports are not supported on matching expressions (yet)
+        if ':' in bits.domain:
+            return False
+
+        return True
+
+
+class IPNetworksField(CharField):
+    widget = Textarea(
+        attrs={
+            'placeholder': mark_safe(_('e.g. 127.0.0.1 or 10.0.0.0/8')),
+            'class': 'span8',
+        },
+    )
+
+    def clean(self, value):
+        if not value:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        values = filter(bool, (v.strip() for v in value.split('\n')))
+        for value in values:
+            try:
+                IPNetwork(value)
+            except ValueError:
+                raise ValidationError('%r is not an acceptable value' % value)
+        return values

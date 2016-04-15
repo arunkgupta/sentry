@@ -47,12 +47,10 @@
     <div id="event_list"></div>
 
     <script>
-    $(function(){
-        new app.GroupListView({
-            className: 'group-list',
-            members: {{ event_list.paginator.objects|to_json:request|safe }},
-            id: "event_list"
-        });
+    new app.GroupListView({
+        className: 'group-list',
+        members: {{ event_list.paginator.objects|to_json:request|safe }},
+        id: "event_list"
     });
     </script>
 

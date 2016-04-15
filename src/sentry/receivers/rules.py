@@ -5,14 +5,15 @@ from django.db.models.signals import post_save
 from sentry.models import Project, Rule
 
 
-def create_default_rules(instance, created=True, **kwargs):
+def create_default_rules(instance, created=True, RuleModel=Rule, **kwargs):
     if not created:
         return
 
-    Rule.objects.create(
+    RuleModel.objects.create(
         project=instance,
         label='Send a notification for new events',
         data={
+            'match': 'all',
             'conditions': [
                 {'id': 'sentry.rules.conditions.first_seen_event.FirstSeenEventCondition'},
             ],
@@ -22,10 +23,11 @@ def create_default_rules(instance, created=True, **kwargs):
         },
     )
 
-    Rule.objects.create(
+    RuleModel.objects.create(
         project=instance,
         label='Send a notification for regressions',
         data={
+            'match': 'all',
             'conditions': [
                 {'id': 'sentry.rules.conditions.regression_event.RegressionEventCondition'},
             ],

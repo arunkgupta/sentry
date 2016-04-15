@@ -9,33 +9,65 @@ sentry.utils.json
 # Avoid shadowing the standard library json module
 from __future__ import absolute_import
 
-from django.core.serializers.json import DjangoJSONEncoder
-import json
-
+from simplejson import JSONEncoder, JSONEncoderForHTML, _default_decoder
 import datetime
 import uuid
+import decimal
+
+from django.utils.timezone import is_aware
 
 
-class BetterJSONEncoder(DjangoJSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, uuid.UUID):
-            return obj.hex
-        elif isinstance(obj, datetime.datetime):
-            return obj.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-        elif isinstance(obj, (set, frozenset)):
-            return list(obj)
-        return super(BetterJSONEncoder, self).default(obj)
+def better_default_encoder(o):
+    if isinstance(o, uuid.UUID):
+        return o.hex
+    elif isinstance(o, datetime.datetime):
+        return o.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    elif isinstance(o, datetime.date):
+        return o.isoformat()
+    elif isinstance(o, datetime.time):
+        if is_aware(o):
+            raise ValueError("JSON can't represent timezone-aware times.")
+        r = o.isoformat()
+        if o.microsecond:
+            r = r[:12]
+        return r
+    elif isinstance(o, (set, frozenset)):
+        return list(o)
+    elif isinstance(o, decimal.Decimal):
+        return str(o)
+    raise TypeError(repr(o) + ' is not JSON serializable')
 
 
-def better_decoder(data):
-    return data
+_default_encoder = JSONEncoder(
+    separators=(',', ':'),
+    ignore_nan=True,
+    skipkeys=False,
+    ensure_ascii=True,
+    check_circular=True,
+    allow_nan=True,
+    indent=None,
+    encoding='utf-8',
+    default=better_default_encoder,
+)
+
+_default_escaped_encoder = JSONEncoderForHTML(
+    separators=(',', ':'),
+    ignore_nan=True,
+    skipkeys=False,
+    ensure_ascii=True,
+    check_circular=True,
+    allow_nan=True,
+    indent=None,
+    encoding='utf-8',
+    default=better_default_encoder,
+)
 
 
-def dumps(value, **kwargs):
-    if 'separators' not in kwargs:
-        kwargs['separators'] = (',', ':')
-    return json.dumps(value, cls=BetterJSONEncoder, **kwargs)
+def dumps(value, escape=False, **kwargs):
+    if escape:
+        return _default_escaped_encoder.encode(value)
+    return _default_encoder.encode(value)
 
 
 def loads(value, **kwargs):
-    return json.loads(value, object_hook=better_decoder)
+    return _default_decoder.decode(value)

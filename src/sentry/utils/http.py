@@ -10,14 +10,21 @@ from __future__ import absolute_import
 import six
 import urllib
 
-from django.conf import settings
+from collections import namedtuple
 from urlparse import urlparse, urljoin
+from ipaddr import IPNetwork
+
+from django.conf import settings
+from sentry import options
+
+
+ParsedUriMatch = namedtuple('ParsedUriMatch', ['scheme', 'domain', 'path'])
 
 
 def absolute_uri(url=None):
     if not url:
-        return settings.SENTRY_URL_PREFIX
-    return urljoin(settings.SENTRY_URL_PREFIX.rstrip('/') + '/', url.lstrip('/'))
+        return options.get('system.url-prefix')
+    return urljoin(options.get('system.url-prefix').rstrip('/') + '/', url.lstrip('/'))
 
 
 def safe_urlencode(params, doseq=0):
@@ -67,9 +74,7 @@ def get_origins(project=None):
         result = []
 
     if project:
-        # TODO: we should cache this
-        from sentry.plugins.helpers import get_option
-        optval = get_option('sentry:origins', project)
+        optval = project.get_option('sentry:origins', ['*'])
         if optval:
             result.extend(optval)
 
@@ -78,7 +83,21 @@ def get_origins(project=None):
     return frozenset(filter(bool, map(lambda x: x.lower().rstrip('/'), result)))
 
 
-def is_valid_origin(origin, project=None):
+def parse_uri_match(value):
+    if '://' in value:
+        scheme, value = value.split('://', 1)
+    else:
+        scheme = '*'
+
+    if '/' in value:
+        domain, path = value.split('/', 1)
+    else:
+        domain, path = value, '*'
+
+    return ParsedUriMatch(scheme, domain, path)
+
+
+def is_valid_origin(origin, project=None, allowed=None):
     """
     Given an ``origin`` which matches a base URI (e.g. http://example.com)
     determine if a valid origin is present in the project settings.
@@ -90,7 +109,12 @@ def is_valid_origin(origin, project=None):
     - *.domain.com: matches domain.com and all subdomains, on any port
     - domain.com: matches domain.com on any port
     """
-    allowed = get_origins(project)
+    if allowed is None:
+        allowed = get_origins(project)
+
+    if not allowed:
+        return False
+
     if '*' in allowed:
         return True
 
@@ -115,20 +139,50 @@ def is_valid_origin(origin, project=None):
     if parsed.hostname is None:
         return False
 
-    for valid in allowed:
-        if '://' in valid:
-            # Support partial uri matches that may include path
-            if origin.startswith(valid):
-                return True
+    for value in allowed:
+        bits = parse_uri_match(value)
+
+        # scheme supports exact and any match
+        if bits.scheme not in ('*', parsed.scheme):
             continue
 
-        if valid[:2] == '*.':
-            # check foo.domain.com and domain.com
-            if parsed.hostname.endswith(valid[1:]) or parsed.hostname == valid[2:]:
+        # domain supports exact, any, and prefix match
+        if bits.domain[:2] == '*.':
+            if parsed.hostname.endswith(bits.domain[1:]) or parsed.hostname == bits.domain[2:]:
                 return True
             continue
+        elif bits.domain not in ('*', parsed.hostname, parsed.netloc):
+            continue
 
-        if parsed.hostname == valid:
+        # path supports exact, any, and suffix match (with or without *)
+        path = bits.path
+        if path == '*':
             return True
-
+        if path.endswith('*'):
+            path = path[:-1]
+        if parsed.path.startswith(path):
+            return True
     return False
+
+
+def is_valid_ip(ip_address, project):
+    """
+    Verify that an IP address is not being blacklisted
+    for the given project.
+    """
+    blacklist = project.get_option('sentry:blacklisted_ips')
+    if not blacklist:
+        return True
+
+    ip_network = IPNetwork(ip_address)
+    for addr in blacklist:
+        # We want to error fast if it's an exact match
+        if ip_address == addr:
+            return False
+
+        # Check to make sure it's actually a range before
+        # attempting to see if we're within that range
+        if '/' in addr and ip_network in IPNetwork(addr):
+            return False
+
+    return True

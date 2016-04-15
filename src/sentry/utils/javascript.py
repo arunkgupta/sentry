@@ -16,15 +16,33 @@ from django.utils.html import escape
 from sentry.app import env, tsdb
 from sentry.constants import TAG_LABELS
 from sentry.models import (
-    Group, GroupBookmark, GroupTagKey, GroupSeen, GroupStatus, ProjectOption
+    Group, GroupBookmark, GroupMeta, GroupTagKey, GroupSeen, GroupStatus,
+    ProjectOption
 )
-from sentry.templatetags.sentry_plugins import get_tags
+from sentry.templatetags.sentry_plugins import get_legacy_annotations
 from sentry.utils import json
 from sentry.utils.db import attach_foreignkey
 from sentry.utils.http import absolute_uri
 
 
 transformers = {}
+
+
+def has_sourcemap(event):
+    if event.platform != 'javascript':
+        return False
+    data = event.data
+
+    if 'sentry.interfaces.Exception' not in data:
+        return False
+    exception = data['sentry.interfaces.Exception']
+    for value in exception['values']:
+        stacktrace = value.get('stacktrace', {})
+        for frame in stacktrace.get('frames', []):
+            if 'sourcemap' in frame.get('data', {}):
+                return True
+
+    return False
 
 
 def transform(objects, request=None):
@@ -73,6 +91,8 @@ class GroupTransformer(Transformer):
         from sentry.templatetags.sentry_plugins import handle_before_events
 
         attach_foreignkey(objects, Group.project, ['team'])
+
+        GroupMeta.objects.populate_cache(objects)
 
         if request and objects:
             handle_before_events(request, objects)
@@ -170,7 +190,6 @@ class GroupTransformer(Transformer):
             'permalink': absolute_uri(reverse('sentry-group', args=[obj.organization.slug, obj.project.slug, obj.id])),
             'firstSeen': self.localize_datetime(obj.first_seen, request=request),
             'lastSeen': self.localize_datetime(obj.last_seen, request=request),
-            'timeSpent': obj.avg_time_spent,
             'canResolve': request and request.user.is_authenticated(),
             'status': status_label,
             'isResolved': obj.get_status() == GroupStatus.RESOLVED,
@@ -190,6 +209,8 @@ class GroupTransformer(Transformer):
             d['historicalData'] = obj.historical_data
         if hasattr(obj, 'annotations'):
             d['annotations'] = obj.annotations
+
+        # TODO(dcramer): these aren't tags, and annotations aren't annotations
         if request:
-            d['tags'] = list(get_tags(obj, request))
+            d['tags'] = get_legacy_annotations(obj, request)
         return d

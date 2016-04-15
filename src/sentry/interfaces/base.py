@@ -7,6 +7,17 @@ from django.utils.translation import ugettext as _
 from sentry.utils.imports import import_string
 
 
+def iter_interfaces():
+    rv = {}
+
+    for name, import_path in settings.SENTRY_INTERFACES.iteritems():
+        rv.setdefault(import_path, []).append(name)
+
+    for import_path, keys in rv.iteritems():
+        iface = import_string(import_path)
+        yield iface, keys
+
+
 def get_interface(name):
     try:
         import_path = settings.SENTRY_INTERFACES[name]
@@ -21,14 +32,22 @@ def get_interface(name):
     return interface
 
 
+class InterfaceValidationError(Exception):
+    pass
+
+
 class Interface(object):
     """
     An interface is a structured representation of data, which may
     render differently than the default ``extra`` metadata in an event.
     """
 
+    _data = None
     score = 0
     display_score = None
+    ephemeral = False
+
+    __slots__ = ['_data']
 
     def __init__(self, **data):
         self._data = data or {}
@@ -37,6 +56,12 @@ class Interface(object):
         if type(self) != type(other):
             return False
         return self._data == other._data
+
+    def __getstate__(self):
+        return dict(
+            (slot, self.__dict__.get(slot))
+            for slot in self.__slots__
+        )
 
     def __setstate__(self, state):
         self.__dict__.update(state)
@@ -56,11 +81,16 @@ class Interface(object):
     def to_python(cls, data):
         return cls(data)
 
+    def get_api_context(self, is_public=False):
+        return self.to_json()
+
     def to_json(self):
         # eliminate empty values for serialization to compress the keyspace
         # and save (seriously) ridiculous amounts of bytes
+        # XXX(dcramer): its important that we keep zero values here, but empty
+        # lists and strings get discarded as we've deemed them not important
         return dict(
-            (k, v) for k, v in self._data.iteritems() if v
+            (k, v) for k, v in self._data.iteritems() if (v == 0 or v)
         )
 
     def get_path(self):
@@ -73,7 +103,7 @@ class Interface(object):
     def get_hash(self):
         return []
 
-    def compute_hashes(self):
+    def compute_hashes(self, platform):
         result = self.get_hash()
         if not result:
             return []
@@ -91,9 +121,6 @@ class Interface(object):
     def get_score(self):
         return self.score
 
-    def to_html(self, event, is_public=False, **kwargs):
-        return ''
-
     def to_string(self, event, is_public=False, **kwargs):
         return ''
 
@@ -101,4 +128,4 @@ class Interface(object):
         body = self.to_string(event)
         if not body:
             return ''
-        return '<pre>%s</pre>' % (escape(body).replace('\n', '<br>'),)
+        return '<pre>%s</pre>' % (escape(body),)

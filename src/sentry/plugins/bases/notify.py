@@ -10,17 +10,22 @@ from __future__ import absolute_import, print_function
 import logging
 
 from django import forms
-from django.utils.translation import ugettext_lazy as _
 
-from sentry.app import ratelimiter
-from sentry.plugins import Plugin
-from sentry.models import UserOption, AccessGroup
-
-
-class Notification(object):
-    def __init__(self, event, rule=None):
-        self.event = event
-        self.rule = rule
+from sentry.app import (
+    digests,
+    ratelimiter,
+)
+from sentry.digests import get_option_key as get_digest_option_key
+from sentry.digests.notifications import (
+    event_to_record,
+    unsplit_key,
+)
+from sentry.plugins import Notification, Plugin
+from sentry.models import (
+    ProjectOption,
+    UserOption,
+)
+from sentry.tasks.digests import deliver_digest
 
 
 class NotificationConfigurationForm(forms.Form):
@@ -44,17 +49,50 @@ class BaseNotificationUserOptionsForm(forms.Form):
 
 
 class NotificationPlugin(Plugin):
-    description = _('Notify project members when a new event is seen for the first time, or when an '
-                    'already resolved event has changed back to unresolved.')
+    description = ('Notify project members when a new event is seen for the first time, or when an '
+                   'already resolved event has changed back to unresolved.')
     # site_conf_form = NotificationConfigurationForm
     project_conf_form = NotificationConfigurationForm
 
     def notify(self, notification):
+        self.logger.info('Notification dispatched [event=%s] [plugin=%s]',
+                         notification.event.id, self.slug)
         event = notification.event
         return self.notify_users(event.group, event)
 
+    def rule_notify(self, event, futures):
+        rules = []
+        for future in futures:
+            rules.append(future.rule)
+            if not future.kwargs:
+                continue
+            raise NotImplementedError('The default behavior for notification de-duplication does not support args')
+
+        project = event.group.project
+        if hasattr(self, 'notify_digest') and digests.enabled(project):
+            get_digest_option = lambda key: ProjectOption.objects.get_value(
+                project,
+                get_digest_option_key(self.get_conf_key(), key),
+            )
+            digest_key = unsplit_key(self, event.group.project)
+            immediate_delivery = digests.add(
+                digest_key,
+                event_to_record(event, rules),
+                increment_delay=get_digest_option('increment_delay'),
+                maximum_delay=get_digest_option('maximum_delay'),
+            )
+            if immediate_delivery:
+                deliver_digest.delay(digest_key)
+
+        else:
+            notification = Notification(event=event, rules=rules)
+            self.notify(notification)
+
     def notify_users(self, group, event, fail_silently=False):
         raise NotImplementedError
+
+    def notify_about_activity(self, activity):
+        pass
 
     def get_sendable_users(self, project):
         conf_key = self.get_conf_key()
@@ -69,17 +107,9 @@ class NotificationPlugin(Plugin):
 
         disabled = set(u for u, v in alert_settings.iteritems() if v == 0)
 
-        # fetch access group members
-        member_set = set(AccessGroup.objects.filter(
-            projects=project,
-            members__is_active=True,
-        ).exclude(members__in=disabled).values_list('members', flat=True))
-
-        if project.team:
-            # fetch team members
-            member_set |= set(project.team.member_set.exclude(
-                user__in=disabled,
-            ).values_list('user', flat=True))
+        member_set = set(project.member_set.exclude(
+            user__in=disabled,
+        ).values_list('user', flat=True))
 
         # determine members default settings
         members_to_check = set(u for u in member_set if u not in alert_settings)
@@ -93,28 +123,42 @@ class NotificationPlugin(Plugin):
 
         return member_set
 
+    def __is_rate_limited(self, group, event):
+        return ratelimiter.is_limited(
+            project=group.project,
+            key=self.get_conf_key(),
+            limit=10,
+        )
+
+    def is_configured(self, project):
+        raise NotImplementedError
+
     def should_notify(self, group, event):
+        project = event.project
+        if not self.is_configured(project=project):
+            return False
+
         if group.is_muted():
             return False
 
-        project = group.project
-
-        rate_limited = ratelimiter.is_limited(
-            project=project,
-            key=self.get_conf_key(),
-            limit=15,
-        )
-
-        if rate_limited:
+        # If the plugin doesn't support digests or they are not enabled,
+        # perform rate limit checks to support backwards compatibility with
+        # older plugins.
+        if not (hasattr(self, 'notify_digest') and digests.enabled(project)) and self.__is_rate_limited(group, event):
             logger = logging.getLogger('sentry.plugins.{0}'.format(self.get_conf_key()))
-            logger.info('Notification for project %s dropped due to rate limiting', project.id)
+            logger.info('Notification for project %r dropped due to rate limiting', project)
+            return False
 
-        return not rate_limited
+        return True
 
     def test_configuration(self, project):
         from sentry.utils.samples import create_sample_event
-        event = create_sample_event(project, default='python')
-        return self.notify_users(event.group, event, fail_silently=False)
+        event = create_sample_event(project, platform='python')
+        notification = Notification(event=event)
+        return self.notify(notification)
+
+    def get_notification_doc_html(self, **kwargs):
+        return ""
 
 
 # Backwards-compatibility

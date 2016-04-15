@@ -2,22 +2,54 @@ from __future__ import absolute_import
 
 from rest_framework.response import Response
 
+from sentry.api.base import DocSection, StatsMixin
+from sentry.api.bases.organization import OrganizationEndpoint
 from sentry.app import tsdb
-from sentry.api.base import BaseStatsEndpoint
-from sentry.api.permissions import assert_perm
-from sentry.models import Organization, Project, Team
+from sentry.models import Project, Team
+from sentry.utils.apidocs import attach_scenarios, scenario
 
 
-class OrganizationStatsEndpoint(BaseStatsEndpoint):
-    def get(self, request, organization_slug):
-        organization = Organization.objects.get_from_cache(
-            slug=organization_slug,
-        )
+@scenario('RetrieveEventCountsOrganization')
+def retrieve_event_counts_organization(runner):
+    runner.request(
+        method='GET',
+        path='/organizations/%s/stats/' % runner.org.slug
+    )
 
-        assert_perm(organization, request.user, request.auth)
 
-        group = request.GET.get('group')
-        if not group:
+class OrganizationStatsEndpoint(OrganizationEndpoint, StatsMixin):
+    doc_section = DocSection.ORGANIZATIONS
+
+    @attach_scenarios([retrieve_event_counts_organization])
+    def get(self, request, organization):
+        """
+        Retrieve Event Counts for an Organization
+        `````````````````````````````````````````
+
+        .. caution::
+           This endpoint may change in the future without notice.
+
+        Return a set of points representing a normalized timestamp and the
+        number of events seen in the period.
+
+        :pparam string organization_slug: the slug of the organization for
+                                          which the stats should be
+                                          retrieved.
+        :qparam string stat: the name of the stat to query (``"received"``,
+                             ``"rejected"``, ``"blacklisted"``)
+        :qparam timestamp since: a timestamp to set the start of the query
+                                 in seconds since UNIX epoch.
+        :qparam timestamp until: a timestamp to set the end of the query
+                                 in seconds since UNIX epoch.
+        :qparam string resolution: an explicit resolution to search
+                                   for (eg: ``10s``).  This should not be
+                                   used unless you are familiar with Sentry's
+                                   internals as it's restricted to pre-defined
+                                   values.
+        :auth: required
+        """
+        group = request.GET.get('group', 'organization')
+        if group == 'organization':
             keys = [organization.id]
         elif group == 'project':
             team_list = Team.objects.get_for_user(
@@ -35,9 +67,14 @@ class OrganizationStatsEndpoint(BaseStatsEndpoint):
         else:
             raise ValueError('Invalid group: %s' % group)
 
+        if 'id' in request.GET:
+            id_filter_set = frozenset(map(int, request.GET.getlist('id')))
+            keys = [k for k in keys if k in id_filter_set]
+
         if not keys:
             return Response([])
 
+        stat_model = None
         stat = request.GET.get('stat', 'received')
         if stat == 'received':
             if group == 'project':
@@ -49,8 +86,17 @@ class OrganizationStatsEndpoint(BaseStatsEndpoint):
                 stat_model = tsdb.models.project_total_rejected
             else:
                 stat_model = tsdb.models.organization_total_rejected
-        else:
-            raise ValueError('Invalid stat: %s' % stat)
+        elif stat == 'blacklisted':
+            if group == 'project':
+                stat_model = tsdb.models.project_total_blacklisted
+            else:
+                stat_model = tsdb.models.organization_total_blacklisted
+        elif stat == 'generated':
+            if group == 'project':
+                stat_model = tsdb.models.project
+
+        if stat_model is None:
+            raise ValueError('Invalid group: %s, stat: %s' % (group, stat))
 
         data = tsdb.get_range(
             model=stat_model,
@@ -58,7 +104,7 @@ class OrganizationStatsEndpoint(BaseStatsEndpoint):
             **self._parse_args(request)
         )
 
-        if not group:
+        if group == 'organization':
             data = data[organization.id]
 
         return Response(data)

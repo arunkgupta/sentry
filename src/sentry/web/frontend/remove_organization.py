@@ -5,10 +5,11 @@ from django.contrib import messages
 from django.core.urlresolvers import reverse
 from django.utils.translation import ugettext_lazy as _
 
-from sentry.models import OrganizationMemberType, OrganizationStatus
+from sentry.models import OrganizationStatus
 from sentry.tasks.deletion import delete_organization
 from sentry.web.frontend.base import OrganizationView
 
+ERR_DEFAULT_ORG = _('You cannot remove the default organization.')
 
 MSG_REMOVE_SUCCESS = _('The %s organization has been scheduled for removal.')
 
@@ -18,7 +19,7 @@ class RemoveOrganizationForm(forms.Form):
 
 
 class RemoveOrganizationView(OrganizationView):
-    required_access = OrganizationMemberType.OWNER
+    required_scope = 'org:delete'
     sudo_required = True
 
     def get_form(self, request, organization):
@@ -27,6 +28,12 @@ class RemoveOrganizationView(OrganizationView):
         return RemoveOrganizationForm()
 
     def handle(self, request, organization):
+        if organization.is_default:
+            messages.add_message(request, messages.ERROR, ERR_DEFAULT_ORG)
+            return self.redirect(reverse('sentry-organization-home', args=[
+                organization.slug
+            ]))
+
         form = self.get_form(request, organization)
         if form.is_valid():
             if organization.status != OrganizationStatus.PENDING_DELETION:

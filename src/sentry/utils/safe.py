@@ -26,23 +26,26 @@ def safe_execute(func, *args, **kwargs):
                 result = func(*args, **kwargs)
         else:
             result = func(*args, **kwargs)
-    except Exception, e:
+    except Exception as exc:
         if hasattr(func, 'im_class'):
             cls = func.im_class
         else:
             cls = func.__class__
-        logger = logging.getLogger('sentry.errors')
-        logger.error('Error processing %r on %r: %s', func.__name__, cls.__name__, e, extra={
-            'func_module': cls.__module__,
-            'func_args': args,
-            'func_kwargs': kwargs,
-        }, exc_info=True)
+
+        func_name = getattr(func, '__name__', str(func))
+        cls_name = cls.__name__
+
+        logger = logging.getLogger('sentry.safe')
+        logger.error(
+            'Error processing %r on %r: %s', func_name, cls_name, exc,
+            exc_info=True,
+        )
     else:
         return result
 
 
 def trim(value, max_size=settings.SENTRY_MAX_VARIABLE_SIZE, max_depth=3,
-         _depth=0, _size=0, **kwargs):
+         object_hook=None, _depth=0, _size=0, **kwargs):
     """
     Truncates a value to ```MAX_VARIABLE_SIZE```.
 
@@ -51,6 +54,7 @@ def trim(value, max_size=settings.SENTRY_MAX_VARIABLE_SIZE, max_depth=3,
     options = {
         'max_depth': max_depth,
         'max_size': max_size,
+        'object_hook': object_hook,
         '_depth': _depth + 1,
     }
 
@@ -83,6 +87,19 @@ def trim(value, max_size=settings.SENTRY_MAX_VARIABLE_SIZE, max_depth=3,
     else:
         result = value
 
+    if object_hook is None:
+        return result
+    return object_hook(result)
+
+
+def trim_pairs(iterable, max_items=settings.SENTRY_MAX_DICTIONARY_ITEMS, **kwargs):
+    max_items -= 1
+    result = []
+    for idx, item in enumerate(iterable):
+        key, value = item
+        result.append((key, trim(value, **kwargs)))
+        if idx > max_items:
+            return result
     return result
 
 

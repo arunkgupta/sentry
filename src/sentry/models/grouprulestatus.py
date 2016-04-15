@@ -14,6 +14,8 @@ from sentry.db.models import FlexibleForeignKey, Model, sane_repr
 
 
 class GroupRuleStatus(Model):
+    __core__ = False
+
     ACTIVE = 0
     INACTIVE = 1
 
@@ -22,6 +24,7 @@ class GroupRuleStatus(Model):
     group = FlexibleForeignKey('sentry.Group')
     status = models.PositiveSmallIntegerField(default=ACTIVE)
     date_added = models.DateTimeField(default=timezone.now)
+    last_active = models.DateTimeField(null=True)
 
     class Meta:
         db_table = 'sentry_grouprulestatus'

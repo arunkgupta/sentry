@@ -5,76 +5,11 @@ from __future__ import absolute_import
 import mock
 
 from django.core.urlresolvers import reverse
-from django.http import HttpRequest
 from exam import fixture
 from social_auth.models import UserSocialAuth
 
-from sentry.models import UserOption, LostPasswordHash, User
+from sentry.models import UserOption, LostPasswordHash, User, ProjectStatus
 from sentry.testutils import TestCase
-from sentry.web.frontend.accounts import login_redirect
-
-
-class LoginTest(TestCase):
-    @fixture
-    def path(self):
-        return reverse('sentry-login')
-
-    def test_renders_correct_template(self):
-        resp = self.client.get(self.path)
-
-        assert resp.status_code == 200
-        self.assertTemplateUsed('sentry/login.html')
-
-    def test_invalid_password(self):
-        # load it once for test cookie
-        self.client.get(self.path)
-
-        resp = self.client.post(self.path, {
-            'username': self.user.username,
-            'password': 'bizbar',
-        })
-        assert resp.status_code == 200
-        assert resp.context['form'].errors['__all__'] == [
-            u'Please enter a correct username and password. Note that both fields may be case-sensitive.'
-        ]
-
-    def test_valid_credentials(self):
-        # load it once for test cookie
-        self.client.get(self.path)
-
-        resp = self.client.post(self.path, {
-            'username': self.user.username,
-            'password': 'admin',
-        })
-        assert resp.status_code == 302
-
-
-class RegisterTest(TestCase):
-    @fixture
-    def path(self):
-        return reverse('sentry-register')
-
-    def test_redirects_if_registration_disabled(self):
-        with self.settings(SENTRY_ALLOW_REGISTRATION=False):
-            resp = self.client.get(self.path)
-            assert resp.status_code == 302
-
-    def test_renders_correct_template(self):
-        with self.settings(SENTRY_ALLOW_REGISTRATION=True):
-            resp = self.client.get(self.path)
-            assert resp.status_code == 200
-            self.assertTemplateUsed('sentry/register.html')
-
-    def test_with_required_params(self):
-        with self.settings(SENTRY_ALLOW_REGISTRATION=True):
-            resp = self.client.post(self.path, {
-                'username': 'test-a-really-long-email-address@example.com',
-                'password': 'foobar',
-            })
-            assert resp.status_code == 302
-            user = User.objects.get(username='test-a-really-long-email-address@example.com')
-            assert user.email == 'test-a-really-long-email-address@example.com'
-            assert user.check_password('foobar')
 
 
 class AppearanceSettingsTest(TestCase):
@@ -99,6 +34,7 @@ class AppearanceSettingsTest(TestCase):
         resp = self.client.post(self.path, {
             'language': 'en',
             'stacktrace_order': '2',
+            'clock_24_hours': True
         })
         assert resp.status_code == 302
 
@@ -106,6 +42,7 @@ class AppearanceSettingsTest(TestCase):
 
         assert options.get('language') == 'en'
         assert options.get('stacktrace_order') == '2'
+        assert options.get('clock_24_hours') is True
 
 
 class SettingsTest(TestCase):
@@ -117,7 +54,7 @@ class SettingsTest(TestCase):
         params = {
             'username': 'foobar',
             'email': 'foo@example.com',
-            'first_name': 'Foo bar',
+            'name': 'Foo bar',
         }
         return dict((k, v) for k, v in params.iteritems() if k not in without)
 
@@ -141,14 +78,14 @@ class SettingsTest(TestCase):
         assert 'form' in resp.context
         assert 'email' in resp.context['form'].errors
 
-    def test_requires_first_name(self):
+    def test_requires_name(self):
         self.login_as(self.user)
 
-        resp = self.client.post(self.path, self.params(without=['first_name']))
+        resp = self.client.post(self.path, self.params(without=['name']))
         assert resp.status_code == 200
         self.assertTemplateUsed('sentry/account/settings.html')
         assert 'form' in resp.context
-        assert 'first_name' in resp.context['form'].errors
+        assert 'name' in resp.context['form'].errors
 
     def test_minimum_valid_params(self):
         self.login_as(self.user)
@@ -158,7 +95,7 @@ class SettingsTest(TestCase):
         resp = self.client.post(self.path, params)
         assert resp.status_code == 302
         user = User.objects.get(id=self.user.id)
-        assert user.first_name == params['first_name']
+        assert user.name == params['name']
         assert user.email == params['email']
 
     def test_can_change_password(self):
@@ -171,49 +108,6 @@ class SettingsTest(TestCase):
         assert resp.status_code == 302
         user = User.objects.get(id=self.user.id)
         assert user.check_password('foobar')
-
-
-class LogoutTest(TestCase):
-    @fixture
-    def path(self):
-        return reverse('sentry-logout')
-
-    def test_logs_user_out(self):
-        self.login_as(self.user)
-
-        resp = self.client.get(self.path)
-        assert resp.status_code == 302
-        assert self.client.session.keys() == []
-
-    def test_same_behavior_with_anonymous_user(self):
-        resp = self.client.get(self.path)
-        assert resp.status_code == 302
-        assert self.client.session.keys() == []
-
-
-class LoginRedirectTest(TestCase):
-    def make_request(self, next=None):
-        request = HttpRequest()
-        request.session = {}
-        request.user = self.user
-        if next:
-            request.session['_next'] = next
-        return request
-
-    def test_schema_uses_default(self):
-        resp = login_redirect(self.make_request('http://example.com'))
-        assert resp.status_code == 302
-        assert resp['Location'] == reverse('sentry')
-
-    def test_login_uses_default(self):
-        resp = login_redirect(self.make_request(reverse('sentry-login')))
-        assert resp.status_code == 302
-        assert resp['Location'] == reverse('sentry')
-
-    def test_no_value_uses_default(self):
-        resp = login_redirect(self.make_request())
-        assert resp.status_code == 302
-        assert resp['Location'] == reverse('sentry')
 
 
 class NotificationSettingsTest(TestCase):
@@ -231,12 +125,20 @@ class NotificationSettingsTest(TestCase):
         self.assertRequiresAuthentication(self.path)
 
     def test_renders_with_required_context(self):
-        self.login_as(self.user)
-
+        user = self.create_user('foo@example.com')
+        organization = self.create_organization()
+        team = self.create_team(organization=organization)
+        project = self.create_project(organization=organization, team=team)
+        team2 = self.create_team(organization=organization)
+        self.create_project(organization=organization, team=team, status=ProjectStatus.PENDING_DELETION)
+        self.create_project(organization=organization, team=team2)
+        self.create_member(organization=organization, user=user, teams=[project.team])
+        self.login_as(user)
         resp = self.client.get(self.path)
         assert resp.status_code == 200
         self.assertTemplateUsed('sentry/account/notifications.html')
         assert 'form' in resp.context
+        assert len(resp.context['project_forms']) == 1
 
     def test_valid_params(self):
         self.login_as(self.user)

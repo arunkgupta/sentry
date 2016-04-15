@@ -10,21 +10,24 @@ from __future__ import absolute_import
 import warnings
 
 from django.contrib.auth.models import AbstractBaseUser, UserManager
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 
-from sentry.db.models import BaseManager, Model
+from sentry.db.models import BaseManager, BaseModel, BoundedAutoField
 
 
 class UserManager(BaseManager, UserManager):
     pass
 
 
-class User(Model, AbstractBaseUser):
+class User(BaseModel, AbstractBaseUser):
+    id = BoundedAutoField(primary_key=True)
     username = models.CharField(_('username'), max_length=128, unique=True)
-    first_name = models.CharField(_('first name'), max_length=30, blank=True)
-    last_name = models.CharField(_('last name'), max_length=30, blank=True)
+    # this column is called first_name for legacy reasons, but it is the entire
+    # display name
+    name = models.CharField(_('name'), max_length=200, blank=True,
+                            db_column='first_name')
     email = models.EmailField(_('email address'), blank=True)
     is_staff = models.BooleanField(
         _('staff status'), default=False,
@@ -57,6 +60,11 @@ class User(Model, AbstractBaseUser):
         verbose_name = _('user')
         verbose_name_plural = _('users')
 
+    def delete(self):
+        if self.username == 'sentry':
+            raise Exception('You cannot delete the "sentry" user as it is required by Sentry.')
+        return super(User, self).delete()
+
     def save(self, *args, **kwargs):
         if not self.username:
             self.username = self.email
@@ -67,11 +75,14 @@ class User(Model, AbstractBaseUser):
         return self.is_superuser
 
     def has_module_perms(self, app_label):
-        # the admin requires this method
+        warnings.warn('User.has_module_perms is deprecated', DeprecationWarning)
         return self.is_superuser
 
+    def get_display_name(self):
+        return self.name or self.email or self.username
+
     def get_full_name(self):
-        return self.first_name
+        return self.name
 
     def get_short_name(self):
         return self.username
@@ -79,22 +90,38 @@ class User(Model, AbstractBaseUser):
     def merge_to(from_user, to_user):
         # TODO: we could discover relations automatically and make this useful
         from sentry.models import (
-            GroupBookmark, Organization, OrganizationMember, ProjectKey, Team,
-            UserOption
+            AuditLogEntry, Activity, AuthIdentity, GroupBookmark,
+            OrganizationMember, UserOption
         )
 
-        for obj in Organization.objects.filter(owner=from_user):
-            obj.update(owner=to_user)
-        for obj in ProjectKey.objects.filter(user=from_user):
-            obj.update(user=to_user)
         for obj in OrganizationMember.objects.filter(user=from_user):
-            obj.update(user=to_user)
-        for obj in Team.objects.filter(owner=from_user):
-            obj.update(owner=to_user)
+            try:
+                with transaction.atomic():
+                    obj.update(user=to_user)
+            except IntegrityError:
+                pass
         for obj in GroupBookmark.objects.filter(user=from_user):
-            obj.update(user=to_user)
+            try:
+                with transaction.atomic():
+                    obj.update(user=to_user)
+            except IntegrityError:
+                pass
         for obj in UserOption.objects.filter(user=from_user):
-            obj.update(user=to_user)
+            try:
+                with transaction.atomic():
+                    obj.update(user=to_user)
+            except IntegrityError:
+                pass
 
-    def get_display_name(self):
-        return self.first_name or self.username
+        Activity.objects.filter(
+            user=from_user,
+        ).update(user=to_user)
+        AuditLogEntry.objects.filter(
+            actor=from_user,
+        ).update(actor=to_user)
+        AuditLogEntry.objects.filter(
+            target_user=from_user,
+        ).update(target_user=to_user)
+        AuthIdentity.objects.filter(
+            user=from_user,
+        ).update(user=to_user)

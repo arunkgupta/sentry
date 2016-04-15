@@ -8,10 +8,11 @@ sentry.search.django.backend
 
 from __future__ import absolute_import
 
+from django.db import router
 from django.db.models import Q
 
-from sentry.api.paginator import Paginator
-from sentry.search.base import SearchBackend
+from sentry.api.paginator import DateTimePaginator, Paginator
+from sentry.search.base import ANY, SearchBackend
 from sentry.search.django.constants import (
     SORT_CLAUSES, SQLITE_SORT_CLAUSES, MYSQL_SORT_CLAUSES, MSSQL_SORT_CLAUSES,
     MSSQL_ENGINES, ORACLE_SORT_CLAUSES
@@ -20,14 +21,15 @@ from sentry.utils.db import get_db_engine
 
 
 class DjangoSearchBackend(SearchBackend):
-    def index(self, event):
-        pass
-
     def query(self, project, query=None, status=None, tags=None,
-              bookmarked_by=None, assigned_to=None, sort_by='date',
-              date_filter='last_seen', date_from=None, date_to=None,
+              bookmarked_by=None, assigned_to=None, first_release=None,
+              sort_by='date', unassigned=None,
+              age_from=None, age_from_inclusive=True,
+              age_to=None, age_to_inclusive=True,
+              date_from=None, date_from_inclusive=True,
+              date_to=None, date_to_inclusive=True,
               cursor=None, limit=100):
-        from sentry.models import Group
+        from sentry.models import Event, Group, GroupStatus
 
         queryset = Group.objects.filter(project=project)
         if query:
@@ -40,7 +42,15 @@ class DjangoSearchBackend(SearchBackend):
                 Q(culprit__icontains=query)
             )
 
-        if status is not None:
+        if status is None:
+            queryset = queryset.exclude(
+                status__in=(
+                    GroupStatus.PENDING_DELETION,
+                    GroupStatus.DELETION_IN_PROGRESS,
+                    GroupStatus.PENDING_MERGE,
+                )
+            )
+        else:
             queryset = queryset.filter(status=status)
 
         if bookmarked_by:
@@ -54,34 +64,78 @@ class DjangoSearchBackend(SearchBackend):
                 assignee_set__project=project,
                 assignee_set__user=assigned_to,
             )
+        elif unassigned in (True, False):
+            queryset = queryset.filter(
+                assignee_set__isnull=unassigned,
+            )
+
+        if first_release:
+            queryset = queryset.filter(
+                first_release__project=project,
+                first_release__version=first_release,
+            )
 
         if tags:
             for k, v in tags.iteritems():
-                queryset = queryset.filter(**dict(
-                    grouptag__key=k,
-                    grouptag__value=v,
-                ))
+                if v == ANY:
+                    queryset = queryset.filter(
+                        grouptag__project=project,
+                        grouptag__key=k,
+                    )
+                else:
+                    queryset = queryset.filter(
+                        grouptag__project=project,
+                        grouptag__key=k,
+                        grouptag__value=v,
+                    )
+            queryset = queryset.distinct()
 
-        if date_filter == 'first_seen':
-            if date_from and date_to:
-                queryset = queryset.filter(
-                    first_seen__gte=date_from,
-                    first_seen__lte=date_to,
-                )
-            elif date_from:
-                queryset = queryset.filter(first_seen__gte=date_from)
-            elif date_to:
-                queryset = queryset.filter(first_seen__lte=date_to)
-        elif date_filter == 'last_seen':
-            if date_from and date_to:
-                queryset = queryset.filter(
-                    first_seen__gte=date_from,
-                    last_seen__lte=date_to,
-                )
-            elif date_from:
-                queryset = queryset.filter(last_seen__gte=date_from)
-            elif date_to:
-                queryset = queryset.filter(last_seen__lte=date_to)
+        if age_from or age_to:
+            params = {}
+            if age_from:
+                if age_from_inclusive:
+                    params['first_seen__gte'] = age_from
+                else:
+                    params['first_seen__gt'] = age_from
+            if age_to:
+                if age_to_inclusive:
+                    params['first_seen__lte'] = age_to
+                else:
+                    params['first_seen__lt'] = age_to
+            queryset = queryset.filter(**params)
+
+        if date_from or date_to:
+            params = {
+                'project_id': project.id,
+            }
+            if date_from:
+                if date_from_inclusive:
+                    params['datetime__gte'] = date_from
+                else:
+                    params['datetime__gt'] = date_from
+            if date_to:
+                if date_to_inclusive:
+                    params['datetime__lte'] = date_to
+                else:
+                    params['datetime__lt'] = date_to
+
+            event_queryset = Event.objects.filter(**params)
+            # limit to the first 1000 results
+            group_ids = event_queryset.distinct().values_list(
+                'group_id',
+                flat=True
+            )[:1000]
+
+            # if Event is not on the primary database remove Django's
+            # implicit subquery by coercing to a list
+            base = router.db_for_read(Group)
+            using = router.db_for_read(Event)
+            if base != using:
+                group_ids = list(group_ids)
+
+            queryset = queryset.filter(
+                id__in=group_ids,
+            )
 
         engine = get_db_engine('default')
         if engine.startswith('sqlite'):
@@ -95,20 +149,28 @@ class DjangoSearchBackend(SearchBackend):
         else:
             score_clause = SORT_CLAUSES[sort_by]
 
-        if sort_by == 'tottime':
-            queryset = queryset.filter(time_spent_count__gt=0)
-        elif sort_by == 'avgtime':
-            queryset = queryset.filter(time_spent_count__gt=0)
-
         queryset = queryset.extra(
             select={'sort_value': score_clause},
         )
 
         # HACK: don't sort by the same column twice
         if sort_by == 'date':
-            queryset = queryset.order_by('-sort_value')
+            paginator_cls = DateTimePaginator
+            sort_clause = '-last_seen'
+        elif sort_by == 'priority':
+            paginator_cls = Paginator
+            sort_clause = '-score'
+        elif sort_by == 'new':
+            paginator_cls = DateTimePaginator
+            sort_clause = '-first_seen'
+        elif sort_by == 'freq':
+            paginator_cls = Paginator
+            sort_clause = '-times_seen'
         else:
-            queryset = queryset.order_by('-sort_value', '-last_seen')
+            paginator_cls = Paginator
+            sort_clause = '-sort_value'
 
-        paginator = Paginator(queryset, '-sort_value')
+        queryset = queryset.order_by(sort_clause)
+
+        paginator = paginator_cls(queryset, sort_clause)
         return paginator.get_result(limit, cursor)

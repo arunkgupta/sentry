@@ -7,39 +7,37 @@
 
 {% block org_auditlog_nav %}active{% endblock %}
 
-{% block inner %}
-  <div class="page-header">
-    <h2>Audit Log</h2>
-  </div>
+{% block main %}
+
+  <h3>Audit Log</h3>
 
   {% paginate audit_log_queryset from request as entry_list per_page 50 %}
 
   {% if entry_list.objects %}
-    <p>{% blocktrans %}Sentry keeps track of important events within your Organization.{% endblocktrans %}</p>
+    <p>{% blocktrans %}Sentry keeps track of important events within your organization.{% endblocktrans %}</p>
 
-    <br>
-
-    <table class="table table-striped">
-      <colgroup>
-        <col width="32px"/>
-        <col/>
-        <col width="150px"/>
-        <col width="100px"/>
-        <col width="200px"/>
-      </colgroup>
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Member</th>
+          <th>Action</th>
+          <th>IP</th>
+          <th>Time</th>
+        </tr>
+      </thead>
       <tbody>
         {% for entry in entry_list.objects %}
           <tr>
-            <td>
-              <img class="avatar avatar32" src="{% gravatar_url entry.actor.email size 32 %}">
-            </td>
-            <td>
-              <strong>{{ entry.actor.get_display_name }}</strong><br>
+            <td class="table-user-info">
+              {% if entry.actor %}
+                <img class="avatar" src="{% gravatar_url entry.actor.email size 72 %}" />
+              {% endif %}
+              <h5>{{ entry.get_actor_name }}</h5>
               {{ entry.get_note }}
             </td>
             <td>{{ entry.get_event_display }}</td>
             <td>{{ entry.ip_address }}</td>
-            <td style="text-align:right">
+            <td>
               <span class="pretty-date" title="{{ entry.datetime|date:"c" }}Z">{{ entry.datetime|timesince }}</span>
             </td>
           </tr>

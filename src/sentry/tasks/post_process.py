@@ -8,40 +8,34 @@ sentry.tasks.post_process
 
 from __future__ import absolute_import, print_function
 
-import logging
-
-from django.conf import settings
-from hashlib import md5
+from celery.utils.log import get_task_logger
+from django.db import IntegrityError, router, transaction
+from raven.contrib.django.models import client as Raven
 
 from sentry.plugins import plugins
-from sentry.rules import EventState, rules
+from sentry.signals import event_processed
 from sentry.tasks.base import instrumented_task
-from sentry.utils.cache import cache
+from sentry.utils import metrics
 from sentry.utils.safe import safe_execute
 
+logger = get_task_logger(__name__)
 
-rules_logger = logging.getLogger('sentry.errors')
 
-
-def condition_matches(project, condition, event, state, rule):
-    condition_cls = rules.get(condition['id'])
-    if condition_cls is None:
-        rules_logger.error('Unregistered condition %r', condition['id'])
+def _capture_stats(event, is_new):
+    # TODO(dcramer): limit platforms to... something?
+    group = event.group
+    platform = group.platform
+    if not platform:
         return
+    platform = platform.split('-', 1)[0].split('_', 1)[0]
 
-    condition_inst = condition_cls(project, data=condition, rule=rule)
-    return safe_execute(condition_inst.passes, event, state)
+    if is_new:
+        metrics.incr('events.unique')
 
-
-def get_rules(project):
-    from sentry.models import Rule
-
-    cache_key = 'project:%d:rules' % (project.id,)
-    rules_list = cache.get(cache_key)
-    if rules_list is None:
-        rules_list = list(Rule.objects.filter(project=project))
-        cache.set(cache_key, rules_list, 60)
-    return rules_list
+    metrics.incr('events.processed')
+    metrics.incr('events.processed.{platform}'.format(
+        platform=platform))
+    metrics.timing('events.size.data', len(unicode(event.data)))
 
 
 @instrumented_task(
@@ -50,115 +44,49 @@ def post_process_group(event, is_new, is_regression, is_sample, **kwargs):
     """
     Fires post processing hooks for a group.
     """
-    from sentry.models import GroupRuleStatus, Project
+    from sentry.models import Project
+    from sentry.rules.processor import RuleProcessor
 
-    project = Project.objects.get_from_cache(id=event.group.project_id)
+    project_id = event.group.project_id
+    Raven.tags_context({
+        'project': project_id,
+    })
 
-    if settings.SENTRY_ENABLE_EXPLORE_CODE:
-        record_affected_code.delay(event=event)
+    project = Project.objects.get_from_cache(id=project_id)
 
-    if settings.SENTRY_ENABLE_EXPLORE_USERS:
-        record_affected_user.delay(event=event)
+    _capture_stats(event, is_new)
+
+    rp = RuleProcessor(event, is_new, is_regression, is_sample)
+    # TODO(dcramer): ideally this would fanout, but serializing giant
+    # objects back and forth isn't super efficient
+    for callback, futures in rp.apply():
+        safe_execute(callback, event, futures)
 
     for plugin in plugins.for_project(project):
-        plugin_post_process_group.apply_async(
-            kwargs={
-                'plugin_slug': plugin.slug,
-                'event': event,
-                'is_new': is_new,
-                'is_regresion': is_regression,
-                'is_sample': is_sample,
-            },
-            expires=120,
-        )
-
-    for rule in get_rules(project):
-        match = rule.data.get('action_match', 'all')
-        condition_list = rule.data.get('conditions', ())
-
-        if not condition_list:
-            continue
-
-        # TODO(dcramer): this might not make sense for other rule actions
-        # so we should find a way to abstract this into actions
-        # TODO(dcramer): this isnt the most efficient query pattern for this
-        rule_status, _ = GroupRuleStatus.objects.get_or_create(
-            rule=rule,
-            group=event.group,
-            defaults={
-                'project': project,
-                'status': GroupRuleStatus.INACTIVE,
-            },
-        )
-
-        state = EventState(
+        plugin_post_process_group(
+            plugin_slug=plugin.slug,
+            event=event,
             is_new=is_new,
-            is_regression=is_regression,
+            is_regresion=is_regression,
             is_sample=is_sample,
-            rule_is_active=rule_status.status == GroupRuleStatus.ACTIVE,
         )
 
-        condition_iter = (
-            condition_matches(project, c, event, state, rule)
-            for c in condition_list
-        )
-
-        if match == 'all':
-            passed = all(condition_iter)
-        elif match == 'any':
-            passed = any(condition_iter)
-        elif match == 'none':
-            passed = not any(condition_iter)
-        else:
-            rules_logger.error('Unsupported action_match %r for rule %d',
-                               match, rule.id)
-            continue
-
-        if passed and rule_status.status == GroupRuleStatus.INACTIVE:
-            # we only fire if we're able to say that the state has changed
-            GroupRuleStatus.objects.filter(
-                id=rule_status.id,
-                status=GroupRuleStatus.INACTIVE,
-            ).update(status=GroupRuleStatus.ACTIVE)
-        elif not passed and rule_status.status == GroupRuleStatus.ACTIVE:
-            # update the state to suggest this rule can fire again
-            GroupRuleStatus.objects.filter(
-                id=rule_status.id,
-                status=GroupRuleStatus.ACTIVE,
-            ).update(status=GroupRuleStatus.INACTIVE)
-
-        if passed:
-            execute_rule.apply_async(
-                kwargs={
-                    'rule_id': rule.id,
-                    'event': event,
-                    'state': state,
-                },
-                expires=120,
-            )
+    event_processed.send_robust(
+        sender=post_process_group,
+        project=project,
+        group=event.group,
+        event=event,
+    )
 
 
-@instrumented_task(
-    name='sentry.tasks.post_process.execute_rule')
-def execute_rule(rule_id, event, state):
-    """
-    Fires post processing hooks for a rule.
-    """
-    from sentry.models import Project, Rule
+def record_additional_tags(event):
+    from sentry.models import Group
 
-    rule = Rule.objects.get(id=rule_id)
-    project = Project.objects.get_from_cache(id=event.project_id)
-    event.project = project
-    event.group.project = project
-
-    for action in rule.data.get('actions', ()):
-        action_cls = rules.get(action['id'])
-        if action_cls is None:
-            rules_logger.error('Unregistered action %r', action['id'])
-            continue
-
-        action_inst = action_cls(project, data=action, rule=rule)
-        safe_execute(action_inst.after, event=event, state=state)
+    added_tags = []
+    for plugin in plugins.for_project(event.project, version=2):
+        added_tags.extend(safe_execute(plugin.get_tags, event) or ())
+    if added_tags:
+        Group.objects.add_tags(event.group, added_tags)
 
 
 @instrumented_task(
@@ -175,70 +103,64 @@ def plugin_post_process_group(plugin_slug, event, **kwargs):
 @instrumented_task(
     name='sentry.tasks.post_process.record_affected_user')
 def record_affected_user(event, **kwargs):
-    from sentry.models import Group
+    from sentry.models import EventUser, Group
 
-    if not settings.SENTRY_ENABLE_EXPLORE_USERS:
+    user_data = event.data.get('sentry.interfaces.User', event.data.get('user'))
+    if not user_data:
+        logger.info('No user data found for event_id=%s', event.event_id)
         return
 
-    user_ident = event.user_ident
-    if not user_ident:
+    euser = EventUser(
+        project=event.project,
+        ident=user_data.get('id'),
+        email=user_data.get('email'),
+        username=user_data.get('username'),
+        ip_address=user_data.get('ip_address'),
+    )
+
+    if not euser.tag_value:
+        # no ident, bail
+        logger.info('No identifying value found for user on event_id=%s',
+                    event.event_id)
         return
 
-    user_data = event.data.get('sentry.interfaces.User', event.data.get('user', {}))
-
-    tag_data = {}
-    for key in ('id', 'email', 'username', 'data'):
-        value = user_data.get(key)
-        if value:
-            tag_data[key] = value
-    tag_data['ip'] = event.ip_address
+    try:
+        with transaction.atomic(using=router.db_for_write(EventUser)):
+            euser.save()
+    except IntegrityError:
+        pass
 
     Group.objects.add_tags(event.group, [
-        ('sentry:user', user_ident, tag_data)
+        ('sentry:user', euser.tag_value)
     ])
 
 
 @instrumented_task(
-    name='sentry.tasks.post_process.record_affected_code')
-def record_affected_code(event, **kwargs):
-    from sentry.models import Group
+    name='sentry.tasks.index_event_tags',
+    default_retry_delay=60 * 5, max_retries=None)
+def index_event_tags(project_id, event_id, tags, **kwargs):
+    from sentry.models import EventTag, Project, TagKey, TagValue
 
-    if not settings.SENTRY_ENABLE_EXPLORE_CODE:
-        return
+    for key, value in tags:
+        tagkey, _ = TagKey.objects.get_or_create(
+            project=Project(id=project_id),
+            key=key,
+        )
 
-    data = event.interfaces.get('sentry.interfaces.Exception')
-    if not data:
-        return
+        tagvalue, _ = TagValue.objects.get_or_create(
+            project=Project(id=project_id),
+            key=key,
+            value=value,
+        )
 
-    checksum = lambda x: md5(x).hexdigest()
-
-    tags = []
-    for exception in data:
-        if not exception.stacktrace:
-            continue
-
-        for frame in exception.stacktrace:
-            # we only tag explicit app frames to avoid excess fat
-            if not frame.in_app:
-                continue
-
-            filename = frame.filename or frame.module
-            if not filename:
-                continue
-
-            tags.append((
-                'sentry:filename',
-                checksum(filename),
-                {'filename': filename},
-            ))
-
-            function = frame.function
-            if function:
-                tags.append((
-                    'sentry:function',
-                    checksum('%s:%s' % (filename, function)),
-                    {'filename': filename, 'function': function}
-                ))
-
-    if tags:
-        Group.objects.add_tags(event.group, tags)
+        try:
+            # handle replaying of this task
+            with transaction.atomic():
+                EventTag.objects.create(
+                    project_id=project_id,
+                    event_id=event_id,
+                    key_id=tagkey.id,
+                    value_id=tagvalue.id,
+                )
+        except IntegrityError:
+            pass

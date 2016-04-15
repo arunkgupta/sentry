@@ -6,19 +6,19 @@ from django.core.urlresolvers import reverse
 from django.http import HttpResponseRedirect
 from django.utils.translation import ugettext_lazy as _
 
-from sentry.models import OrganizationMemberType
-from sentry.permissions import can_add_organization_member
+from sentry import roles
+from sentry.signals import member_invited
 from sentry.web.frontend.base import OrganizationView
 from sentry.web.forms.invite_organization_member import InviteOrganizationMemberForm
 from sentry.web.forms.add_organization_member import AddOrganizationMemberForm
 
 
 class CreateOrganizationMemberView(OrganizationView):
-    required_access = OrganizationMemberType.ADMIN
+    required_scope = 'org:write'
 
-    def get_form(self, request):
+    def get_form(self, request, organization):
         initial = {
-            'type': OrganizationMemberType.MEMBER,
+            'role': organization.default_role,
         }
 
         if settings.SENTRY_ENABLE_INVITES:
@@ -29,16 +29,16 @@ class CreateOrganizationMemberView(OrganizationView):
         return form_cls(request.POST or None, initial=initial)
 
     def handle(self, request, organization):
-        if not can_add_organization_member(request.user, organization):
-            return HttpResponseRedirect(reverse('sentry'))
-
-        form = self.get_form(request)
+        form = self.get_form(request, organization)
         if form.is_valid():
             om, created = form.save(request.user, organization, request.META['REMOTE_ADDR'])
 
             if created:
                 messages.add_message(request, messages.SUCCESS,
                     _('The organization member was added.'))
+
+                member_invited.send(member=om, user=request.user, sender=self)
+
             else:
                 messages.add_message(request, messages.INFO,
                     _('The organization member already exists.'))
@@ -51,6 +51,7 @@ class CreateOrganizationMemberView(OrganizationView):
         context = {
             'form': form,
             'is_invite': settings.SENTRY_ENABLE_INVITES,
+            'role_list': roles.get_all(),
         }
 
         return self.respond('sentry/create-organization-member.html', context)

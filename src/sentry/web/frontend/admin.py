@@ -7,33 +7,34 @@ sentry.web.frontend.admin
 """
 from __future__ import absolute_import, print_function
 
-import datetime
+import functools
 import logging
-import pkg_resources
 import sys
 import uuid
+from collections import defaultdict
 
+import pkg_resources
+import six
 from django.conf import settings
 from django.core.context_processors import csrf
-from django.core.mail import send_mail
 from django.core.urlresolvers import reverse
 from django.db import transaction
 from django.db.models import Count
-from django.http import HttpResponseRedirect
-from django.utils import timezone
+from django.http import HttpResponse, HttpResponseRedirect
 from django.views.decorators.csrf import csrf_protect
 
-import six
-
+from sentry import options
 from sentry.app import env
-from sentry.models import Team, Project, User
+from sentry.models import Project, Team, User
 from sentry.plugins import plugins
+from sentry.utils.email import send_mail
 from sentry.utils.http import absolute_uri
-from sentry.web.forms import (
-    NewUserForm, ChangeUserForm, RemoveUserForm, TestEmailForm)
+from sentry.utils.warnings import DeprecatedSettingWarning, seen_warnings
 from sentry.web.decorators import requires_admin
-from sentry.web.helpers import (
-    render_to_response, plugin_config, render_to_string)
+from sentry.web.forms import (
+    ChangeUserForm, NewUserForm, RemoveUserForm, TestEmailForm
+)
+from sentry.web.helpers import render_to_response, render_to_string
 
 
 def configure_plugin(request, slug):
@@ -41,9 +42,9 @@ def configure_plugin(request, slug):
     if not plugin.has_site_conf():
         return HttpResponseRedirect(reverse('sentry'))
 
-    action, view = plugin_config(plugin, None, request)
-    if action == 'redirect':
-        return HttpResponseRedirect(request.path)
+    view = plugin.configure(request)
+    if isinstance(view, HttpResponse):
+        return view
 
     return render_to_response('sentry/admin/plugins/configure.html', {
         'plugin': plugin,
@@ -58,14 +59,14 @@ def manage_projects(request):
     project_list = Project.objects.filter(
         status=0,
         team__isnull=False,
-    ).select_related('owner', 'team')
+    ).select_related('team')
 
     project_query = request.GET.get('pquery')
     if project_query:
         project_list = project_list.filter(name__icontains=project_query)
 
     sort = request.GET.get('sort')
-    if sort not in ('name', 'date', 'events'):
+    if sort not in ('name', 'date'):
         sort = 'date'
 
     if sort == 'date':
@@ -93,7 +94,7 @@ def manage_users(request):
         user_list = user_list.filter(email__icontains=user_query)
 
     sort = request.GET.get('sort')
-    if sort not in ('name', 'joined', 'login', 'projects'):
+    if sort not in ('name', 'joined', 'login'):
         sort = 'joined'
 
     if sort == 'joined':
@@ -101,7 +102,7 @@ def manage_users(request):
     elif sort == 'login':
         order_by = '-last_login'
     elif sort == 'name':
-        order_by = 'first_name'
+        order_by = 'name'
 
     user_list = user_list.order_by(order_by)
 
@@ -116,7 +117,7 @@ def manage_users(request):
 @transaction.atomic
 @csrf_protect
 def create_new_user(request):
-    if not request.user.is_superuser:
+    if not request.is_superuser():
         return HttpResponseRedirect(reverse('sentry'))
 
     form = NewUserForm(request.POST or None, initial={
@@ -132,31 +133,18 @@ def create_new_user(request):
 
         user.save()
 
-        if form.cleaned_data['create_project']:
-            project = Project.objects.create(
-                name='%s\'s New Project' % user.username.capitalize()
-            )
-            member = project.team.member_set.get(user=user)
-            key = project.key_set.get(user=user)
-
         if form.cleaned_data['send_welcome_mail']:
             context = {
                 'username': user.username,
                 'password': password,
                 'url': absolute_uri(reverse('sentry')),
             }
-            if form.cleaned_data['create_project']:
-                context.update({
-                    'project': project,
-                    'member': member,
-                    'dsn': key.get_dsn(),
-                })
             body = render_to_string('sentry/emails/welcome_mail.txt', context, request)
 
             try:
                 send_mail(
-                    '%s Welcome to Sentry' % (settings.EMAIL_SUBJECT_PREFIX,),
-                    body, settings.SERVER_EMAIL, [user.email],
+                    '%s Welcome to Sentry' % (options.get('mail.subject-prefix'),),
+                    body, options.get('mail.from'), [user.email],
                     fail_silently=False
                 )
             except Exception as e:
@@ -176,7 +164,7 @@ def create_new_user(request):
 @requires_admin
 @csrf_protect
 def edit_user(request, user_id):
-    if not request.user.is_superuser:
+    if not request.is_superuser():
         return HttpResponseRedirect(reverse('sentry'))
 
     try:
@@ -191,7 +179,7 @@ def edit_user(request, user_id):
 
     project_list = Project.objects.filter(
         status=0,
-        team__member_set__user=user,
+        organization__member_set__user=user,
     ).order_by('-date_added')
 
     context = {
@@ -242,7 +230,7 @@ def list_user_projects(request, user_id):
 
     project_list = Project.objects.filter(
         status=0,
-        member_set__user=user,
+        organization__member_set__user=user,
     ).order_by('-date_added')
 
     context = {
@@ -255,7 +243,7 @@ def list_user_projects(request, user_id):
 
 @requires_admin
 def manage_teams(request):
-    team_list = Team.objects.order_by('-date_added').select_related('owner')
+    team_list = Team.objects.order_by('-date_added')
 
     team_query = request.GET.get('tquery')
     if team_query:
@@ -320,8 +308,38 @@ def status_packages(request):
 
     return render_to_response('sentry/admin/status/packages.html', {
         'modules': sorted([(p.project_name, p.version) for p in pkg_resources.working_set]),
-        'extensions': [(p.get_title(), '%s.%s' % (p.__module__, p.__class__.__name__)) for p in plugins.all()],
+        'extensions': [
+            (p.get_title(), '%s.%s' % (p.__module__, p.__class__.__name__))
+            for p in plugins.all(version=None)
+        ],
     }, request)
+
+
+@requires_admin
+def status_warnings(request):
+    groupings = {
+        DeprecatedSettingWarning: 'Deprecated Settings',
+    }
+
+    groups = defaultdict(list)
+    warnings = []
+    for warning in seen_warnings:
+        cls = type(warning)
+        if cls in groupings:
+            groups[cls].append(warning)
+        else:
+            warnings.append(warning)
+
+    sort_by_message = functools.partial(sorted, key=str)
+
+    return render_to_response(
+        'sentry/admin/status/warnings.html',
+        {
+            'groups': [(groupings[key], sort_by_message(values)) for key, values in groups.items()],
+            'warnings': sort_by_message(warnings),
+        },
+        request,
+    )
 
 
 @requires_admin
@@ -333,8 +351,8 @@ def status_mail(request):
         body = """This email was sent as a request to test the Sentry outbound email configuration."""
         try:
             send_mail(
-                '%s Test Email' % (settings.EMAIL_SUBJECT_PREFIX,),
-                body, settings.SERVER_EMAIL, [request.user.email],
+                '%s Test Email' % (options.get('mail.subject-prefix'),),
+                body, options.get('mail.from'), [request.user.email],
                 fail_silently=False
             )
         except Exception as e:
@@ -342,25 +360,11 @@ def status_mail(request):
 
     return render_to_response('sentry/admin/status/mail.html', {
         'form': form,
-        'EMAIL_HOST': settings.EMAIL_HOST,
-        'EMAIL_HOST_PASSWORD': bool(settings.EMAIL_HOST_PASSWORD),
-        'EMAIL_HOST_USER': settings.EMAIL_HOST_USER,
-        'EMAIL_PORT': settings.EMAIL_PORT,
-        'EMAIL_USE_TLS': settings.EMAIL_USE_TLS,
-        'SERVER_EMAIL': settings.SERVER_EMAIL,
-    }, request)
-
-
-@requires_admin
-def stats(request):
-    new_projects = Project.objects.filter(
-        date_added__gte=timezone.now() - datetime.timedelta(hours=24),
-    ).count()
-    statistics = (
-        ('Projects', Project.objects.count()),
-        ('Projects (24h)', new_projects),
-    )
-
-    return render_to_response('sentry/admin/stats.html', {
-        'statistics': statistics,
+        'mail_host': options.get('mail.host'),
+        'mail_password': bool(options.get('mail.password')),
+        'mail_username': options.get('mail.username'),
+        'mail_port': options.get('mail.port'),
+        'mail_use_tls': options.get('mail.use-tls'),
+        'mail_from': options.get('mail.from'),
+        'mail_list_namespace': options.get('mail.list-namespace'),
     }, request)

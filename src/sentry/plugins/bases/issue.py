@@ -9,14 +9,19 @@ from __future__ import absolute_import
 
 from django import forms
 from django.conf import settings
-from django.utils.html import escape
-from django.utils.safestring import mark_safe
+from django.utils.html import format_html
 from social_auth.models import UserSocialAuth
 
-from sentry.models import GroupMeta, Activity
+from sentry.models import (
+    Activity,
+    Event,
+    GroupMeta,
+)
 from sentry.plugins import Plugin
+from sentry.signals import issue_tracker_used
 from sentry.utils.auth import get_auth_providers
 from sentry.utils.http import absolute_uri
+from sentry.utils.safe import safe_execute
 
 
 class NewIssueForm(forms.Form):
@@ -24,7 +29,7 @@ class NewIssueForm(forms.Form):
     description = forms.CharField(widget=forms.Textarea(attrs={'class': 'span9'}))
 
 
-class IssuePlugin(Plugin):
+class IssueTrackingPlugin(Plugin):
     # project_conf_form = BaseIssueOptionsForm
     new_issue_form = NewIssueForm
 
@@ -34,10 +39,12 @@ class IssuePlugin(Plugin):
     auth_provider = None
 
     def _get_group_body(self, request, group, event, **kwargs):
-        interface = event.interfaces.get('sentry.interfaces.Stacktrace')
-        if interface:
-            return interface.to_string(event)
-        return
+        result = []
+        for interface in event.interfaces.itervalues():
+            output = safe_execute(interface.to_string, event)
+            if output:
+                result.append(output)
+        return '\n\n'.join(result)
 
     def _get_group_description(self, request, group, event):
         output = [
@@ -157,6 +164,7 @@ class IssuePlugin(Plugin):
 
         prefix = self.get_conf_key()
         event = group.get_latest_event()
+        Event.objects.bind_nodes([event], 'data')
 
         form = self.get_new_issue_form(request, group, event)
         if form.is_valid():
@@ -176,6 +184,7 @@ class IssuePlugin(Plugin):
                 'title': form.cleaned_data['title'],
                 'provider': self.get_title(),
                 'location': self.get_issue_url(group, issue_id),
+                'label': self.get_issue_label(group=group, issue_id=issue_id),
             }
             Activity.objects.create(
                 project=group.project,
@@ -185,6 +194,7 @@ class IssuePlugin(Plugin):
                 data=issue_information,
             )
 
+            issue_tracker_used.send(plugin=self, project=group.project, user=request.user, sender=IssueTrackingPlugin)
             return self.redirect(group.get_absolute_url())
 
         context = {
@@ -211,9 +221,14 @@ class IssuePlugin(Plugin):
         if not issue_id:
             return tag_list
 
-        tag_list.append(mark_safe('<a href="%s">%s</a>' % (
+        tag_list.append(format_html('<a href="{}">{}</a>',
             self.get_issue_url(group=group, issue_id=issue_id),
-            escape(self.get_issue_label(group=group, issue_id=issue_id)),
-        )))
+            self.get_issue_label(group=group, issue_id=issue_id),
+        ))
 
         return tag_list
+
+    def get_issue_doc_html(self, **kwargs):
+        return ""
+
+IssuePlugin = IssueTrackingPlugin

@@ -7,6 +7,9 @@ sentry.models.projectkey
 """
 from __future__ import absolute_import, print_function
 
+import petname
+import six
+
 from bitfield import BitField
 from urlparse import urlparse
 from uuid import uuid4
@@ -14,12 +17,19 @@ from uuid import uuid4
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
+from django.utils.translation import ugettext_lazy as _
 
-import six
-
+from sentry import options
 from sentry.db.models import (
-    Model, BaseManager, FlexibleForeignKey, sane_repr
+    Model, BaseManager, BoundedPositiveIntegerField, FlexibleForeignKey,
+    sane_repr
 )
+
+
+# TODO(dcramer): pull in enum library
+class ProjectKeyStatus(object):
+    ACTIVE = 0
+    INACTIVE = 1
 
 
 class ProjectKey(Model):
@@ -27,7 +37,6 @@ class ProjectKey(Model):
     label = models.CharField(max_length=64, blank=True, null=True)
     public_key = models.CharField(max_length=32, unique=True, null=True)
     secret_key = models.CharField(max_length=32, unique=True, null=True)
-    user = FlexibleForeignKey(settings.AUTH_USER_MODEL, null=True)
     roles = BitField(flags=(
         # access to post events to the store endpoint
         ('store', 'Event API access'),
@@ -35,9 +44,10 @@ class ProjectKey(Model):
         # read/write access to rest API
         ('api', 'Web API access'),
     ), default=['store'])
-
-    # For audits
-    user_added = FlexibleForeignKey(settings.AUTH_USER_MODEL, null=True, related_name='keys_added_set')
+    status = BoundedPositiveIntegerField(default=0, choices=(
+        (ProjectKeyStatus.ACTIVE, _('Active')),
+        (ProjectKeyStatus.INACTIVE, _('Inactive')),
+    ), db_index=True)
     date_added = models.DateTimeField(default=timezone.now, null=True)
 
     objects = BaseManager(cache_fields=(
@@ -45,11 +55,21 @@ class ProjectKey(Model):
         'secret_key',
     ))
 
+    # support legacy project keys in API
+    scopes = (
+        'project:read',
+        'project:write',
+        'project:delete',
+        'event:read',
+        'event:write',
+        'event:delete',
+    )
+
     class Meta:
         app_label = 'sentry'
         db_table = 'sentry_projectkey'
 
-    __repr__ = sane_repr('project_id', 'user_id', 'public_key')
+    __repr__ = sane_repr('project_id', 'public_key')
 
     def __unicode__(self):
         return six.text_type(self.public_key)
@@ -58,11 +78,40 @@ class ProjectKey(Model):
     def generate_api_key(cls):
         return uuid4().hex
 
+    @classmethod
+    def from_dsn(cls, dsn):
+        urlparts = urlparse(dsn)
+
+        public_key = urlparts.username
+        project_id = urlparts.path.rsplit('/', 1)[-1]
+
+        return ProjectKey.objects.get(
+            public_key=public_key,
+            project=project_id,
+        )
+
+    @classmethod
+    def get_default(cls, project):
+        try:
+            return cls.objects.filter(
+                project=project,
+                roles=cls.roles.store,
+                status=ProjectKeyStatus.ACTIVE
+            )[0]
+        except IndexError:
+            return None
+
+    @property
+    def is_active(self):
+        return self.status == ProjectKeyStatus.ACTIVE
+
     def save(self, *args, **kwargs):
         if not self.public_key:
             self.public_key = ProjectKey.generate_api_key()
         if not self.secret_key:
             self.secret_key = ProjectKey.generate_api_key()
+        if not self.label:
+            self.label = petname.Generate(2, ' ').title()
         super(ProjectKey, self).save(*args, **kwargs)
 
     def get_dsn(self, domain=None, secure=True, public=False):
@@ -71,9 +120,12 @@ class ProjectKey(Model):
             url = settings.SENTRY_ENDPOINT
         else:
             key = self.public_key
-            url = settings.SENTRY_PUBLIC_ENDPOINT
+            url = settings.SENTRY_PUBLIC_ENDPOINT or settings.SENTRY_ENDPOINT
 
-        urlparts = urlparse(url or settings.SENTRY_URL_PREFIX)
+        if url:
+            urlparts = urlparse(url)
+        else:
+            urlparts = urlparse(options.get('system.url-prefix'))
 
         return '%s://%s@%s/%s' % (
             urlparts.scheme,
@@ -89,3 +141,19 @@ class ProjectKey(Model):
     @property
     def dsn_public(self):
         return self.get_dsn(public=True)
+
+    def get_allowed_origins(self):
+        from sentry.utils.http import get_origins
+        return get_origins(self.project)
+
+    def get_audit_log_data(self):
+        return {
+            'label': self.label,
+            'public_key': self.public_key,
+            'secret_key': self.secret_key,
+            'roles': int(self.roles),
+            'status': self.status,
+        }
+
+    def get_scopes(self):
+        return self.scopes

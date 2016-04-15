@@ -7,7 +7,9 @@ sentry.testutils.fixtures
 """
 from __future__ import absolute_import, print_function, unicode_literals
 
+import json
 import six
+import warnings
 
 from django.utils.text import slugify
 from exam import fixture
@@ -15,7 +17,7 @@ from uuid import uuid4
 
 from sentry.models import (
     Activity, Event, Group, Organization, OrganizationMember,
-    OrganizationMemberType, Project, Team, User
+    OrganizationMemberTeam, Project, Team, User
 )
 from sentry.utils.compat import pickle
 from sentry.utils.strings import decompress
@@ -28,7 +30,7 @@ LEGACY_DATA = pickle.loads(decompress("""eJy9WW1v20YS/q5fwfqLpECluMvXFSzjgKK9Bri
 class Fixtures(object):
     @fixture
     def projectkey(self):
-        return self.create_project_key(project=self.project, user=self.user)
+        return self.create_project_key(project=self.project)
 
     @fixture
     def user(self):
@@ -46,12 +48,22 @@ class Fixtures(object):
 
     @fixture
     def team(self):
-        return self.create_team(
+        team = self.create_team(
             organization=self.organization,
             name='foo',
             slug='foo',
-            owner=self.organization.owner,
         )
+        # XXX: handle legacy team fixture
+        queryset = OrganizationMember.objects.filter(
+            organization=self.organization,
+        )
+        for om in queryset:
+            OrganizationMemberTeam.objects.create(
+                team=team,
+                organizationmember=om,
+                is_active=True,
+            )
+        return team
 
     @fixture
     def project(self):
@@ -72,25 +84,37 @@ class Fixtures(object):
     @fixture
     def activity(self):
         return Activity.objects.create(
-            group=self.group, event=self.event, project=self.project,
+            group=self.group, project=self.project,
             type=Activity.NOTE, user=self.user,
             data={}
         )
 
     def create_organization(self, **kwargs):
-        kwargs.setdefault('name', uuid4().hex)
-        if not kwargs.get('owner'):
-            kwargs['owner'] = self.user
+        owner = kwargs.pop('owner', None)
+        if not owner:
+            owner = self.user
 
-        return Organization.objects.create(**kwargs)
+        kwargs.setdefault('name', uuid4().hex)
+
+        org = Organization.objects.create(**kwargs)
+        self.create_member(
+            organization=org,
+            user=owner,
+            role='owner',
+        )
+        return org
 
     def create_member(self, teams=None, **kwargs):
-        kwargs.setdefault('type', OrganizationMemberType.MEMBER)
+        kwargs.setdefault('role', 'member')
 
         om = OrganizationMember.objects.create(**kwargs)
         if teams:
             for team in teams:
-                om.teams.add(team)
+                OrganizationMemberTeam.objects.create(
+                    team=team,
+                    organizationmember=om,
+                    is_active=True,
+                )
         return om
 
     def create_team(self, **kwargs):
@@ -99,8 +123,6 @@ class Fixtures(object):
             kwargs['slug'] = slugify(six.text_type(kwargs['name']))
         if not kwargs.get('organization'):
             kwargs['organization'] = self.organization
-        if not kwargs.get('owner'):
-            kwargs['owner'] = kwargs['organization'].owner
 
         return Team.objects.create(**kwargs)
 
@@ -115,8 +137,8 @@ class Fixtures(object):
 
         return Project.objects.create(**kwargs)
 
-    def create_project_key(self, project, user):
-        return project.key_set.get_or_create(user=user)[0]
+    def create_project_key(self, project):
+        return project.key_set.get_or_create()[0]
 
     def create_user(self, email=None, **kwargs):
         if not email:
@@ -124,6 +146,7 @@ class Fixtures(object):
 
         kwargs.setdefault('username', email)
         kwargs.setdefault('is_staff', True)
+        kwargs.setdefault('is_active', True)
         kwargs.setdefault('is_superuser', False)
 
         user = User(email=email, **kwargs)
@@ -133,12 +156,12 @@ class Fixtures(object):
         return user
 
     def create_event(self, event_id=None, **kwargs):
+        if event_id is None:
+            event_id = uuid4().hex
         if 'group' not in kwargs:
             kwargs['group'] = self.group
         kwargs.setdefault('project', kwargs['group'].project)
         kwargs.setdefault('message', kwargs['group'].message)
-        if event_id is None:
-            event_id = uuid4().hex
         kwargs.setdefault('data', LEGACY_DATA.copy())
         if kwargs.get('tags'):
             tags = kwargs.pop('tags')
@@ -146,14 +169,95 @@ class Fixtures(object):
                 tags = tags.items()
             kwargs['data']['tags'] = tags
 
-        return Event.objects.create(
+        event = Event(
             event_id=event_id,
             **kwargs
         )
+        # emulate EventManager refs
+        event.data.bind_ref(event)
+        event.save()
+        return event
 
-    def create_group(self, project=None, **kwargs):
+    def create_full_event(self, event_id='a', **kwargs):
+        payload = """
+            {
+                "id": "f5dd88e612bc406ba89dfebd09120769",
+                "project": 11276,
+                "release": "e1b5d1900526feaf20fe2bc9cad83d392136030a",
+                "platform": "javascript",
+                "culprit": "app/components/events/eventEntries in map",
+                "message": "TypeError: Cannot read property '1' of null",
+                "tags": [
+                    ["environment", "prod"],
+                    ["sentry_version", "e1b5d1900526feaf20fe2bc9cad83d392136030a"],
+                    ["level", "error"],
+                    ["logger", "javascript"],
+                    ["sentry:release", "e1b5d1900526feaf20fe2bc9cad83d392136030a"],
+                    ["browser", "Chrome 48.0"],
+                    ["device", "Other"],
+                    ["os", "Windows 10"],
+                    ["url", "https://app.getsentry.com/katon-direct/localhost/issues/112734598/"],
+                    ["sentry:user", "id:41656"]
+                ],
+                "errors": [{
+                    "url": "<anonymous>",
+                    "type": "js_no_source"
+                }],
+                "extra": {
+                    "session:duration": 40364
+                },
+                "sentry.interfaces.Exception": {
+                    "exc_omitted": null,
+                    "values": [{
+                        "stacktrace": {
+                            "has_system_frames": false,
+                            "frames": [{
+                                "function": "batchedUpdates",
+                                "abs_path": "webpack:////usr/src/getsentry/src/sentry/~/react/lib/ReactUpdates.js",
+                                "pre_context": ["  // verify that that's the case. (This is called by each top-level update", "  // function, like setProps, setState, forceUpdate, etc.; creation and", "  // destruction of top-level components is guarded in ReactMount.)", "", "  if (!batchingStrategy.isBatchingUpdates) {"],
+                                "post_context": ["    return;", "  }", "", "  dirtyComponents.push(component);", "}"],
+                                "filename": "~/react/lib/ReactUpdates.js",
+                                "module": "react/lib/ReactUpdates",
+                                "colno": 0,
+                                "in_app": false,
+                                "data": {
+                                    "orig_filename": "/_static/29e365f8b0d923bc123e8afa38d890c3/sentry/dist/vendor.js",
+                                    "orig_abs_path": "https://media.getsentry.com/_static/29e365f8b0d923bc123e8afa38d890c3/sentry/dist/vendor.js",
+                                    "sourcemap": "https://media.getsentry.com/_static/29e365f8b0d923bc123e8afa38d890c3/sentry/dist/vendor.js.map",
+                                    "orig_lineno": 37,
+                                    "orig_function": "Object.s [as enqueueUpdate]",
+                                    "orig_colno": 16101
+                                },
+                                "context_line": "    batchingStrategy.batchedUpdates(enqueueUpdate, component);",
+                                "lineno": 176
+                            }],
+                            "frames_omitted": null
+                        },
+                        "type": "TypeError",
+                        "value": "Cannot read property '1' of null",
+                        "module": null
+                    }]
+                },
+                "sentry.interfaces.Http": {
+                    "url": "https://app.getsentry.com/katon-direct/localhost/issues/112734598/",
+                    "headers": [
+                        ["Referer", "https://getsentry.com/welcome/"],
+                        ["User-Agent", "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/48.0.2564.109 Safari/537.36"]
+                    ]
+                },
+                "sentry.interfaces.User": {
+                    "ip_address": "0.0.0.0",
+                    "id": "41656",
+                    "email": "test@example.com"
+                },
+                "version": "7"
+            }"""
+        return self.create_event(event_id=event_id, platform='javascript', data=json.loads(payload))
+
+    def create_group(self, project=None, checksum=None, **kwargs):
+        if checksum:
+            warnings.warn('Checksum passed to create_group', DeprecationWarning)
         kwargs.setdefault('message', 'Hello world')
-        kwargs.setdefault('checksum', uuid4().hex)
         return Group.objects.create(
             project=project or self.project,
             **kwargs

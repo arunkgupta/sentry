@@ -12,7 +12,6 @@ import itertools
 from django.contrib import messages
 from django.contrib.auth import login as login_user, authenticate
 from django.core.context_processors import csrf
-from django.core.urlresolvers import reverse
 from django.db import transaction
 from django.http import HttpResponseRedirect
 from django.views.decorators.cache import never_cache
@@ -21,110 +20,23 @@ from django.utils import timezone
 from sudo.decorators import sudo_required
 
 from sentry.models import (
-    LostPasswordHash, Organization, Project, Team, UserOption
+    LostPasswordHash, Project, ProjectStatus, UserOption
 )
 from sentry.plugins import plugins
 from sentry.web.decorators import login_required
 from sentry.web.forms.accounts import (
     AccountSettingsForm, NotificationSettingsForm, AppearanceSettingsForm,
-    RegistrationForm, RecoverPasswordForm, ChangePasswordRecoverForm,
-    ProjectEmailOptionsForm, AuthenticationForm)
+    RecoverPasswordForm, ChangePasswordRecoverForm,
+    ProjectEmailOptionsForm)
 from sentry.web.helpers import render_to_response
-from sentry.utils.auth import get_auth_providers
+from sentry.utils.auth import get_auth_providers, get_login_redirect
 from sentry.utils.safe import safe_execute
-
-
-@csrf_protect
-@never_cache
-def login(request):
-    from django.conf import settings
-
-    if request.user.is_authenticated():
-        return login_redirect(request)
-
-    form = AuthenticationForm(request, request.POST or None,
-                              captcha=bool(request.session.get('needs_captcha')))
-    if form.is_valid():
-        login_user(request, form.get_user())
-
-        request.session.pop('needs_captcha', None)
-
-        return login_redirect(request)
-
-    elif request.POST and not request.session.get('needs_captcha'):
-        request.session['needs_captcha'] = 1
-        form = AuthenticationForm(request, request.POST or None, captcha=True)
-        form.errors.pop('captcha', None)
-
-    request.session.set_test_cookie()
-
-    context = csrf(request)
-    context.update({
-        'form': form,
-        'next': request.session.get('_next'),
-        'CAN_REGISTER': settings.SENTRY_ALLOW_REGISTRATION or request.session.get('can_register'),
-        'AUTH_PROVIDERS': get_auth_providers(),
-        'SOCIAL_AUTH_CREATE_USERS': settings.SOCIAL_AUTH_CREATE_USERS,
-    })
-    return render_to_response('sentry/login.html', context, request)
-
-
-@csrf_protect
-@never_cache
-@transaction.atomic
-def register(request):
-    from django.conf import settings
-
-    if not (settings.SENTRY_ALLOW_REGISTRATION or request.session.get('can_register')):
-        return HttpResponseRedirect(reverse('sentry'))
-
-    form = RegistrationForm(request.POST or None,
-                            captcha=bool(request.session.get('needs_captcha')))
-    if form.is_valid():
-        user = form.save()
-
-        # can_register should only allow a single registration
-        request.session.pop('can_register', None)
-
-        # HACK: grab whatever the first backend is and assume it works
-        user.backend = settings.AUTHENTICATION_BACKENDS[0]
-
-        login_user(request, user)
-
-        request.session.pop('needs_captcha', None)
-
-        return login_redirect(request)
-
-    elif request.POST and not request.session.get('needs_captcha'):
-        request.session['needs_captcha'] = 1
-        form = RegistrationForm(request.POST or None, captcha=True)
-        form.errors.pop('captcha', None)
-
-    return render_to_response('sentry/register.html', {
-        'form': form,
-        'AUTH_PROVIDERS': get_auth_providers(),
-        'SOCIAL_AUTH_CREATE_USERS': settings.SOCIAL_AUTH_CREATE_USERS,
-    }, request)
 
 
 @login_required
 def login_redirect(request):
-    default = reverse('sentry')
-    login_url = request.session.pop('_next', None) or default
-    if '//' in login_url:
-        login_url = default
-    elif login_url.startswith(reverse('sentry-login')):
-        login_url = default
+    login_url = get_login_redirect(request)
     return HttpResponseRedirect(login_url)
-
-
-@never_cache
-def logout(request):
-    from django.contrib.auth import logout
-
-    logout(request)
-
-    return HttpResponseRedirect(reverse('sentry'))
 
 
 def recover(request):
@@ -137,6 +49,7 @@ def recover(request):
         if not password_hash.is_valid():
             password_hash.date_added = timezone.now()
             password_hash.set_hash()
+            password_hash.save()
 
         password_hash.send_recover_mail()
 
@@ -208,7 +121,7 @@ def settings(request):
     form = AccountSettingsForm(request.user, request.POST or None, initial={
         'email': request.user.email,
         'username': request.user.username,
-        'first_name': request.user.first_name,
+        'name': request.user.name,
     })
     if form.is_valid():
         form.save()
@@ -237,7 +150,8 @@ def appearance_settings(request):
     form = AppearanceSettingsForm(request.user, request.POST or None, initial={
         'language': options.get('language') or request.LANGUAGE_CODE,
         'stacktrace_order': int(options.get('stacktrace_order', -1) or -1),
-        'timezone': options.get('timezone') or settings.TIME_ZONE,
+        'timezone': options.get('timezone') or settings.SENTRY_DEFAULT_TIME_ZONE,
+        'clock_24_hours': options.get('clock_24_hours') or False,
     })
     if form.is_valid():
         form.save()
@@ -261,24 +175,11 @@ def appearance_settings(request):
 def notification_settings(request):
     settings_form = NotificationSettingsForm(request.user, request.POST or None)
 
-    # TODO(dcramer): this is an extremely bad pattern and we need a more optimal
-    # solution for rendering this (that ideally plays well with the org data)
-    project_list = []
-    organization_list = Organization.objects.get_for_user(
-        user=request.user,
-    )
-    for organization in organization_list:
-        team_list = Team.objects.get_for_user(
-            user=request.user,
-            organization=organization,
-        )
-        for team in team_list:
-            project_list.extend(
-                Project.objects.get_for_user(
-                    user=request.user,
-                    team=team,
-                )
-            )
+    project_list = list(Project.objects.filter(
+        team__organizationmemberteam__organizationmember__user=request.user,
+        team__organizationmemberteam__is_active=True,
+        status=ProjectStatus.VISIBLE,
+    ).distinct())
 
     project_forms = [
         (project, ProjectEmailOptionsForm(
@@ -286,7 +187,8 @@ def notification_settings(request):
             request.POST or None,
             prefix='project-%s' % (project.id,)
         ))
-        for project in sorted(project_list, key=lambda x: (x.team.name, x.name))
+        for project in sorted(project_list, key=lambda x: (
+            x.team.name if x.team else None, x.name))
     ]
 
     ext_forms = []

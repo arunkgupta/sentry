@@ -12,10 +12,10 @@ __all__ = ('Exception',)
 
 from django.conf import settings
 
-from sentry.interfaces.base import Interface
-from sentry.interfaces.stacktrace import Stacktrace, is_newest_frame_first
+from sentry.interfaces.base import Interface, InterfaceValidationError
+from sentry.interfaces.stacktrace import Stacktrace, slim_frame_data
+from sentry.utils import json
 from sentry.utils.safe import trim
-from sentry.web.helpers import render_to_string
 
 
 class SingleException(Interface):
@@ -40,17 +40,33 @@ class SingleException(Interface):
     display_score = 1200
 
     @classmethod
-    def to_python(cls, data):
-        assert data.get('type') or data.get('value')
+    def to_python(cls, data, has_system_frames=None, slim_frames=True):
+        if not (data.get('type') or data.get('value')):
+            raise InterfaceValidationError("No 'type' or 'value' present")
 
-        if data.get('stacktrace'):
-            stacktrace = Stacktrace.to_python(data['stacktrace'])
+        if data.get('stacktrace') and data['stacktrace'].get('frames'):
+            stacktrace = Stacktrace.to_python(
+                data['stacktrace'],
+                has_system_frames=has_system_frames,
+                slim_frames=slim_frames,
+            )
         else:
             stacktrace = None
 
+        type = data.get('type')
+        value = data.get('value')
+        if not type and ':' in value.split(' ', 1)[0]:
+            type, value = value.split(':', 1)
+            # in case of TypeError: foo (no space)
+            value = value.strip()
+
+        if value is not None and not isinstance(value, basestring):
+            value = json.dumps(value)
+        value = trim(value, 4096)
+
         kwargs = {
-            'type': trim(data.get('type'), 128),
-            'value': trim(data.get('value'), 1024),
+            'type': trim(type, 128),
+            'value': value,
             'module': trim(data.get('module'), 128),
             'stacktrace': stacktrace,
         }
@@ -70,6 +86,19 @@ class SingleException(Interface):
             'stacktrace': stacktrace,
         }
 
+    def get_api_context(self, is_public=False):
+        if self.stacktrace:
+            stacktrace = self.stacktrace.get_api_context(is_public=is_public)
+        else:
+            stacktrace = None
+
+        return {
+            'type': self.type,
+            'value': unicode(self.value) if self.value else None,
+            'module': self.module,
+            'stacktrace': stacktrace,
+        }
+
     def get_alias(self):
         return 'exception'
 
@@ -85,35 +114,6 @@ class SingleException(Interface):
         if not output:
             output = filter(bool, [self.type, self.value])
         return output
-
-    def get_context(self, event, is_public=False, **kwargs):
-        last_frame = None
-        interface = event.interfaces.get('sentry.interfaces.Stacktrace')
-        if interface is not None and interface.frames:
-            last_frame = interface.frames[-1]
-
-        e_module = self.module
-        e_type = self.type
-        e_value = self.value
-
-        if self.module:
-            fullname = '%s.%s' % (e_module, e_type)
-        else:
-            fullname = e_type
-
-        if e_value and not e_type:
-            e_type = e_value
-            e_value = None
-
-        return {
-            'is_public': is_public,
-            'event': event,
-            'exception_type': e_type,
-            'exception_value': e_value,
-            'exception_module': e_module,
-            'fullname': fullname,
-            'last_frame': last_frame,
-        }
 
 
 class Exception(Interface):
@@ -148,36 +148,6 @@ class Exception(Interface):
 
     score = 2000
 
-    @classmethod
-    def to_python(cls, data):
-        if 'values' not in data:
-            data = {'values': [data]}
-
-        assert data['values']
-
-        trim_exceptions(data)
-
-        kwargs = {
-            'values': [
-                SingleException.to_python(v)
-                for v in data['values']
-            ],
-        }
-
-        if data.get('exc_omitted'):
-            assert len(data['exc_omitted']) == 2
-            kwargs['exc_omitted'] = data['exc_omitted']
-        else:
-            kwargs['exc_omitted'] = None
-
-        return cls(**kwargs)
-
-    def to_json(self):
-        return {
-            'values': [v.to_json() for v in self.values],
-            'exc_omitted': self.exc_omitted,
-        }
-
     def __getitem__(self, key):
         return self.values[key]
 
@@ -187,13 +157,77 @@ class Exception(Interface):
     def __len__(self):
         return len(self.values)
 
+    @classmethod
+    def to_python(cls, data):
+        if 'values' not in data:
+            data = {'values': [data]}
+
+        if not data['values']:
+            raise InterfaceValidationError("No 'values' present")
+
+        has_system_frames = cls.data_has_system_frames(data)
+
+        kwargs = {
+            'values': [
+                SingleException.to_python(
+                    v,
+                    has_system_frames=has_system_frames,
+                    slim_frames=False,
+                )
+                for v in data['values']
+            ],
+        }
+
+        if data.get('exc_omitted'):
+            if len(data['exc_omitted']) != 2:
+                raise InterfaceValidationError("Invalid value for 'exc_omitted'")
+            kwargs['exc_omitted'] = data['exc_omitted']
+        else:
+            kwargs['exc_omitted'] = None
+
+        instance = cls(**kwargs)
+        # we want to wait to slim things til we've reconciled in_app
+        slim_exception_data(instance)
+        return instance
+
+    @classmethod
+    def data_has_system_frames(cls, data):
+        system_frames = 0
+        app_frames = 0
+        for exc in data['values']:
+            if not exc.get('stacktrace'):
+                continue
+
+            frames = exc['stacktrace'].get('frames')
+            if not frames:
+                continue
+
+            for frame in frames:
+                # XXX(dcramer): handle PHP sending an empty array for a frame
+                if not isinstance(frame, dict):
+                    continue
+                if frame.get('in_app') is True:
+                    app_frames += 1
+                else:
+                    system_frames += 1
+
+        # if there is a mix of frame styles then we indicate that system frames
+        # are present and should be represented as a split
+        return bool(app_frames and system_frames)
+
+    def to_json(self):
+        return {
+            'values': [v.to_json() for v in self.values],
+            'exc_omitted': self.exc_omitted,
+        }
+
     def get_alias(self):
         return 'exception'
 
     def get_path(self):
         return 'sentry.interfaces.Exception'
 
-    def compute_hashes(self):
+    def compute_hashes(self, platform):
         system_hash = self.get_hash(system_frames=True)
         if not system_hash:
             return []
@@ -224,55 +258,19 @@ class Exception(Interface):
 
         return output
 
-    def get_context(self, event, is_public=False, **kwargs):
-        newest_first = is_newest_frame_first(event)
-        context_kwargs = {
-            'event': event,
-            'is_public': is_public,
-            'newest_first': newest_first,
-        }
-
-        exceptions = []
-        last = len(self.values) - 1
-        for num, e in enumerate(self.values):
-            context = e.get_context(**context_kwargs)
-            if e.stacktrace:
-                context['stacktrace'] = e.stacktrace.get_context(
-                    with_stacktrace=False, **context_kwargs)
-            else:
-                context['stacktrace'] = {}
-            context['stack_id'] = 'exception_%d' % (num,)
-            context['is_root'] = num == last
-            exceptions.append(context)
-
-        if newest_first:
-            exceptions.reverse()
-
-        if self.exc_omitted:
-            first_exc_omitted, last_exc_omitted = self.exc_omitted
-        else:
-            first_exc_omitted, last_exc_omitted = None, None
-
+    def get_api_context(self, is_public=False):
         return {
-            'newest_first': newest_first,
-            'system_frames': sum(e['stacktrace'].get('system_frames', 0) for e in exceptions),
-            'exceptions': exceptions,
-            'stacktrace': self.get_stacktrace(event, newest_first=newest_first),
-            'first_exc_omitted': first_exc_omitted,
-            'last_exc_omitted': last_exc_omitted,
+            'values': [
+                v.get_api_context(is_public=is_public)
+                for v in self.values
+            ],
+            'hasSystemFrames': any(
+                v.stacktrace.has_system_frames
+                for v in self.values
+                if v.stacktrace
+            ),
+            'excOmitted': self.exc_omitted,
         }
-
-    def to_html(self, event, **kwargs):
-        if not self.values:
-            return ''
-
-        if len(self.values) == 1 and not self.values[0].stacktrace:
-            exception = self.values[0]
-            context = exception.get_context(event=event, **kwargs)
-            return render_to_string('sentry/partial/interfaces/exception.html', context)
-
-        context = self.get_context(event=event, **kwargs)
-        return render_to_string('sentry/partial/interfaces/chained_exception.html', context)
 
     def to_string(self, event, is_public=False, **kwargs):
         if not self.values:
@@ -294,18 +292,17 @@ class Exception(Interface):
         return ''
 
 
-def trim_exceptions(data, max_values=settings.SENTRY_MAX_EXCEPTIONS):
-    # TODO: this doesnt account for cases where the client has already omitted
-    # exceptions
-    values = data['values']
-    exc_len = len(values)
+def slim_exception_data(instance, frame_allowance=settings.SENTRY_MAX_STACKTRACE_FRAMES):
+    """
+    Removes various excess metadata from middle frames which go beyond
+    ``frame_allowance``.
+    """
+    # TODO(dcramer): it probably makes sense to prioritize a certain exception
+    # rather than distributing allowance among all exceptions
+    frames = []
+    for exception in instance.values:
+        if not exception.stacktrace:
+            continue
+        frames.extend(exception.stacktrace.frames)
 
-    if exc_len <= max_values:
-        return
-
-    half_max = max_values / 2
-
-    data['exc_omitted'] = (half_max, exc_len - half_max)
-
-    for n in xrange(half_max, exc_len - half_max):
-        del values[half_max]
+    slim_frame_data(frames, frame_allowance)

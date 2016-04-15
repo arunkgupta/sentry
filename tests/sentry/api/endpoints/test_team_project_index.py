@@ -1,4 +1,7 @@
+from __future__ import absolute_import
+
 from django.core.urlresolvers import reverse
+
 from sentry.models import Project
 from sentry.testutils import APITestCase
 
@@ -11,7 +14,8 @@ class TeamProjectIndexTest(APITestCase):
         project_2 = self.create_project(team=team, slug='buzz')
 
         url = reverse('sentry-api-0-team-project-index', kwargs={
-            'team_id': team.id,
+            'organization_slug': team.organization.slug,
+            'team_slug': team.slug,
         })
         response = self.client.get(url)
         assert response.status_code == 200
@@ -27,7 +31,8 @@ class TeamProjectCreateTest(APITestCase):
         self.login_as(user=self.user)
         team = self.create_team(slug='baz')
         url = reverse('sentry-api-0-team-project-index', kwargs={
-            'team_id': team.id,
+            'organization_slug': team.organization.slug,
+            'team_slug': team.slug,
         })
         resp = self.client.post(url, data={
             'name': 'hello world',

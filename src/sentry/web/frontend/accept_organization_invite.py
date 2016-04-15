@@ -3,12 +3,15 @@ from __future__ import absolute_import
 from django import forms
 from django.contrib import messages
 from django.core.urlresolvers import reverse
-from django.utils.translation import ugettext as _
+from django.utils.translation import ugettext_lazy as _
 
 from sentry.models import (
     AuditLogEntry, AuditLogEntryEvent, OrganizationMember, Project
 )
+from sentry.signals import member_joined
 from sentry.web.frontend.base import BaseView
+
+ERR_INVITE_INVALID = _('The invite link you followed is not valid.')
 
 
 class AcceptInviteForm(forms.Form):
@@ -31,7 +34,7 @@ class AcceptOrganizationInviteView(BaseView):
         except OrganizationMember.DoesNotExist:
             messages.add_message(
                 request, messages.ERROR,
-                _('The invite link you followed is no longer valid.')
+                ERR_INVITE_INVALID,
             )
 
             return self.redirect(reverse('sentry'))
@@ -39,7 +42,7 @@ class AcceptOrganizationInviteView(BaseView):
         if not om.is_pending:
             messages.add_message(
                 request, messages.ERROR,
-                _('The invite link you followed is no longer valid.')
+                ERR_INVITE_INVALID,
             )
 
             return self.redirect(reverse('sentry'))
@@ -47,28 +50,22 @@ class AcceptOrganizationInviteView(BaseView):
         if om.token != token:
             messages.add_message(
                 request, messages.ERROR,
-                _('The invite link you followed is no longer valid.')
+                ERR_INVITE_INVALID,
             )
             return self.redirect(reverse('sentry'))
 
         organization = om.organization
 
-        if om.has_global_access:
-            qs = Project.objects.filter(
-                team__organization=organization,
-            )
-        else:
-            qs = Project.objects.filter(
-                team__in=om.teams.all(),
-            )
-
-        qs = qs.select_related('team')
-
-        project_list = list(qs)
+        qs = Project.objects.filter(
+            organization=organization,
+        )
+        project_list = list(qs.select_related('team')[:25])
+        project_count = qs.count()
 
         context = {
             'organization': om.organization,
             'project_list': project_list,
+            'project_count': project_count,
             'needs_authentication': not request.user.is_authenticated(),
         }
 
@@ -111,6 +108,8 @@ class AcceptOrganizationInviteView(BaseView):
                         organization.name.encode('utf-8'),
                     )
                 )
+
+                member_joined.send(member=om, sender=self)
 
             request.session.pop('can_register', None)
 

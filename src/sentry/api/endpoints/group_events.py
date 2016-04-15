@@ -1,37 +1,51 @@
 from __future__ import absolute_import
 
-from sentry.api.base import DocSection, Endpoint
-from sentry.api.permissions import assert_perm
+from sentry.api.base import DocSection
+from sentry.api.bases import GroupEndpoint
 from sentry.api.serializers import serialize
+from sentry.api.paginator import DateTimePaginator
 from sentry.models import Event, Group
+from sentry.utils.apidocs import scenario, attach_scenarios
 
 
-class GroupEventsEndpoint(Endpoint):
+@scenario('ListAvailableSamples')
+def list_available_samples_scenario(runner):
+    group = Group.objects.filter(project=runner.default_project).first()
+    runner.request(
+        method='GET',
+        path='/issues/%s/events/' % group.id
+    )
+
+
+class GroupEventsEndpoint(GroupEndpoint):
     doc_section = DocSection.EVENTS
 
-    def get(self, request, group_id):
+    @attach_scenarios([list_available_samples_scenario])
+    def get(self, request, group):
         """
-        List an aggregate's events
+        List an Issue's Events
+        ``````````````````````
 
-        Return a list of events bound to an aggregate.
+        This endpoint lists an issue's events.
 
-            {method} {path}
-
+        :pparam string issue_id: the ID of the issue to retrieve.
+        :auth: required
         """
-        group = Group.objects.get(
-            id=group_id,
-        )
-
-        assert_perm(group, request.user, request.auth)
 
         events = Event.objects.filter(
-            group=group
+            group_id=group.id,
         )
+
+        query = request.GET.get('query')
+        if query:
+            events = events.filter(
+                message__icontains=query,
+            )
 
         return self.paginate(
             request=request,
             queryset=events,
-            # TODO(dcramer): we want to sort by datetime
-            order_by='-id',
+            order_by='-datetime',
             on_results=lambda x: serialize(x, request.user),
+            paginator_cls=DateTimePaginator,
         )

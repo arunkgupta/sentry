@@ -20,8 +20,6 @@ from sentry.db.models.manager import BaseManager
 class UserOptionManager(BaseManager):
     def __init__(self, *args, **kwargs):
         super(UserOptionManager, self).__init__(*args, **kwargs)
-        task_postrun.connect(self.clear_cache)
-        request_finished.connect(self.clear_cache)
         self.__metadata = {}
 
     def __getstate__(self):
@@ -89,6 +87,11 @@ class UserOptionManager(BaseManager):
     def clear_cache(self, **kwargs):
         self.__metadata = {}
 
+    def contribute_to_class(self, model, name):
+        super(UserOptionManager, self).contribute_to_class(model, name)
+        task_postrun.connect(self.clear_cache)
+        request_finished.connect(self.clear_cache)
+
 
 # TODO(dcramer): the NULL UNIQUE constraint here isnt valid, and instead has to
 # be manually replaced in the database. We should restructure this model.
@@ -98,6 +101,10 @@ class UserOption(Model):
 
     Options which are specific to a plugin should namespace
     their key. e.g. key='myplugin:optname'
+
+    Keeping user feature state
+    key: "feature:assignment"
+    value: { updated: datetime, state: bool }
     """
     user = FlexibleForeignKey(settings.AUTH_USER_MODEL)
     project = FlexibleForeignKey('sentry.Project', null=True)

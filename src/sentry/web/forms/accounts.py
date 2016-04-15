@@ -70,8 +70,15 @@ TIMEZONE_CHOICES = _get_timezone_choices()
 
 class AuthenticationForm(CaptchaForm):
     username = forms.CharField(
-        label=_('Username or email'), max_length=128)
-    password = forms.CharField(label=_("Password"), widget=forms.PasswordInput)
+        label=_('Account'), max_length=128, widget=forms.TextInput(
+            attrs={'placeholder': _('username or email'),
+        }),
+    )
+    password = forms.CharField(
+        label=_('Password'), widget=forms.PasswordInput(
+            attrs={'placeholder': _('password'),
+        }),
+    )
 
     error_messages = {
         'invalid_login': _("Please enter a correct %(username)s and password. "
@@ -97,6 +104,12 @@ class AuthenticationForm(CaptchaForm):
         self.username_field = UserModel._meta.get_field(UserModel.USERNAME_FIELD)
         if not self.fields['username'].label:
             self.fields['username'].label = capfirst(self.username_field.verbose_name)
+
+    def clean_username(self):
+        value = (self.cleaned_data.get('username') or '').strip()
+        if not value:
+            return
+        return value.lower()
 
     def clean(self):
         username = self.cleaned_data.get('username')
@@ -140,7 +153,7 @@ class RegistrationForm(CaptchaModelForm):
         model = User
 
     def clean_username(self):
-        value = self.cleaned_data.get('username')
+        value = (self.cleaned_data.get('username') or '').strip()
         if not value:
             return
         if User.objects.filter(username__iexact=value).exists():
@@ -160,15 +173,15 @@ class RecoverPasswordForm(CaptchaForm):
     user = forms.CharField(label=_('Username or email'))
 
     def clean_user(self):
-        value = self.cleaned_data.get('user')
-        if value:
-            users = find_users(value, with_valid_password=False)
-            if not users:
-                raise forms.ValidationError(_("We were unable to find a matching user."))
-            if len(users) > 1:
-                raise forms.ValidationError(_("Multiple accounts were found matching this email address."))
-            return users[0]
-        return None
+        value = (self.cleaned_data.get('user') or '').strip()
+        if not value:
+            return
+        users = find_users(value, with_valid_password=False)
+        if not users:
+            raise forms.ValidationError(_("We were unable to find a matching user."))
+        if len(users) > 1:
+            raise forms.ValidationError(_("Multiple accounts were found matching this email address."))
+        return users[0]
 
 
 class ChangePasswordRecoverForm(forms.Form):
@@ -178,12 +191,14 @@ class ChangePasswordRecoverForm(forms.Form):
 class NotificationSettingsForm(forms.Form):
     alert_email = forms.EmailField(help_text=_('Designate an alternative email address to send email notifications to.'), required=False)
     subscribe_by_default = forms.ChoiceField(
+        label=_('Alerts'),
         choices=(
             ('1', _('Automatically subscribe to notifications for new projects')),
             ('0', _('Do not subscribe to notifications for new projects')),
         ), required=False,
         widget=forms.Select(attrs={'class': 'input-xxlarge'}))
     subscribe_notes = forms.ChoiceField(
+        label=_('Notes'),
         choices=(
             ('1', _('Get notified about new notes')),
             ('0', _('Do not subscribe to note notifications')),
@@ -239,7 +254,7 @@ class NotificationSettingsForm(forms.Form):
 class AccountSettingsForm(forms.Form):
     username = forms.CharField(label=_('Username'), max_length=128)
     email = forms.EmailField(label=_('Email'))
-    first_name = forms.CharField(required=True, label=_('Name'), max_length=30)
+    name = forms.CharField(required=True, label=_('Name'), max_length=30)
     new_password = forms.CharField(label=_('New password'), widget=forms.PasswordInput, required=False)
 
     def __init__(self, user, *args, **kwargs):
@@ -248,8 +263,8 @@ class AccountSettingsForm(forms.Form):
 
         if self.user.is_managed:
             # username and password always managed, email and
-            # first_name optionally managed
-            for field in ('email', 'first_name', 'username'):
+            # name optionally managed
+            for field in ('email', 'name', 'username'):
                 if field == 'username' or field in settings.SENTRY_MANAGED_USER_FIELDS:
                     self.fields[field] = ReadOnlyTextField(label=self.fields[field].label)
             # don't show password field at all
@@ -261,7 +276,7 @@ class AccountSettingsForm(forms.Form):
 
     def is_readonly(self):
         if self.user.is_managed:
-            return set(('email', 'first_name')) == set(settings.SENTRY_MANAGED_USER_FIELDS)
+            return set(('email', 'name')) == set(settings.SENTRY_MANAGED_USER_FIELDS)
         return False
 
     def _clean_managed_field(self, field):
@@ -273,8 +288,8 @@ class AccountSettingsForm(forms.Form):
     def clean_email(self):
         return self._clean_managed_field('email')
 
-    def clean_first_name(self):
-        return self._clean_managed_field('first_name')
+    def clean_name(self):
+        return self._clean_managed_field('name')
 
     def clean_username(self):
         value = self._clean_managed_field('username')
@@ -285,7 +300,7 @@ class AccountSettingsForm(forms.Form):
     def save(self, commit=True):
         if self.cleaned_data.get('new_password'):
             self.user.set_password(self.cleaned_data['new_password'])
-        self.user.first_name = self.cleaned_data['first_name']
+        self.user.name = self.cleaned_data['name']
 
         if self.cleaned_data['email'] != self.user.email:
             new_username = self.user.email == self.user.username
@@ -320,6 +335,10 @@ class AppearanceSettingsForm(forms.Form):
     timezone = forms.ChoiceField(
         label=_('Time zone'), choices=TIMEZONE_CHOICES, required=False,
         widget=forms.Select(attrs={'class': 'input-xxlarge'}))
+    clock_24_hours = forms.BooleanField(
+        label=_('Use a 24-hour clock'),
+        required=False,
+    )
 
     def __init__(self, user, *args, **kwargs):
         self.user = user
@@ -348,6 +367,14 @@ class AppearanceSettingsForm(forms.Form):
             project=None,
             key='timezone',
             value=self.cleaned_data['timezone'],
+        )
+
+        # Save clock 24 hours option
+        UserOption.objects.set_value(
+            user=self.user,
+            project=None,
+            key='clock_24_hours',
+            value=self.cleaned_data['clock_24_hours'],
         )
 
         return self.user

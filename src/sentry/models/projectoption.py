@@ -20,8 +20,6 @@ from sentry.utils.cache import cache
 class ProjectOptionManager(BaseManager):
     def __init__(self, *args, **kwargs):
         super(ProjectOptionManager, self).__init__(*args, **kwargs)
-        task_postrun.connect(self.clear_local_cache)
-        request_finished.connect(self.clear_local_cache)
         self.__cache = {}
 
     def __getstate__(self):
@@ -35,6 +33,7 @@ class ProjectOptionManager(BaseManager):
         self.__cache = {}
 
     def _make_key(self, instance_id):
+        assert instance_id
         return '%s:%s' % (self.model._meta.db_table, instance_id)
 
     def get_value_bulk(self, instances, key):
@@ -60,7 +59,7 @@ class ProjectOptionManager(BaseManager):
         self.create_or_update(
             project=project,
             key=key,
-            defaults={
+            values={
                 'value': value,
             },
         )
@@ -99,6 +98,11 @@ class ProjectOptionManager(BaseManager):
 
     def post_delete(self, instance, **kwargs):
         self.reload_cache(instance.project_id)
+
+    def contribute_to_class(self, model, name):
+        super(ProjectOptionManager, self).contribute_to_class(model, name)
+        task_postrun.connect(self.clear_local_cache)
+        request_finished.connect(self.clear_local_cache)
 
 
 class ProjectOption(Model):

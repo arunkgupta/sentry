@@ -1,7 +1,13 @@
 from __future__ import absolute_import
 
+__all__ = ['DocSection', 'Endpoint', 'StatsMixin']
+
+import time
+
 from datetime import datetime, timedelta
+from django.conf import settings
 from django.utils.http import urlquote
+from django.views.decorators.csrf import csrf_exempt
 from enum import Enum
 from pytz import utc
 from rest_framework.authentication import SessionAuthentication
@@ -10,86 +16,184 @@ from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from sentry.tsdb.base import ROLLUPS
+from sentry.app import raven, tsdb
+from sentry.models import ApiKey, AuditLogEntry
+from sentry.utils.cursors import Cursor
+from sentry.utils.http import absolute_uri, is_valid_origin
 
-from .authentication import KeyAuthentication
+from .authentication import ApiKeyAuthentication
 from .paginator import Paginator
+from .permissions import NoPermission
 
 
 ONE_MINUTE = 60
 ONE_HOUR = ONE_MINUTE * 60
 ONE_DAY = ONE_HOUR * 24
 
-LINK_HEADER = '<{uri}&cursor={cursor}>; rel="{name}"'
+LINK_HEADER = '<{uri}&cursor={cursor}>; rel="{name}"; results="{has_results}"; cursor="{cursor}"'
+
+DEFAULT_AUTHENTICATION = (
+    ApiKeyAuthentication,
+    SessionAuthentication
+)
 
 
 class DocSection(Enum):
     ACCOUNTS = 'Accounts'
     EVENTS = 'Events'
+    ORGANIZATIONS = 'Organizations'
+    PROJECTS = 'Projects'
     RELEASES = 'Releases'
-    # ORGANIZATIONS = 'Organizations'
-    # PROJECTS = 'Projects'
-    # TEAMS = 'Teams'
+    TEAMS = 'Teams'
 
 
 class Endpoint(APIView):
-    authentication_classes = (KeyAuthentication, SessionAuthentication)
+    authentication_classes = DEFAULT_AUTHENTICATION
     renderer_classes = (JSONRenderer,)
     parser_classes = (JSONParser,)
+    permission_classes = (NoPermission,)
 
-    def paginate(self, request, on_results=lambda x: x, **kwargs):
+    def build_cursor_link(self, request, name, cursor):
+        querystring = u'&'.join(
+            u'{0}={1}'.format(urlquote(k), urlquote(v))
+            for k, v in request.GET.iteritems()
+            if k != 'cursor'
+        )
+        base_url = absolute_uri(request.path)
+        if querystring:
+            base_url = '{0}?{1}'.format(base_url, querystring)
+        else:
+            base_url = base_url + '?'
+
+        return LINK_HEADER.format(
+            uri=base_url,
+            cursor=str(cursor),
+            name=name,
+            has_results='true' if bool(cursor) else 'false',
+        )
+
+    def convert_args(self, request, *args, **kwargs):
+        return (args, kwargs)
+
+    def handle_exception(self, request, exc):
+        try:
+            return super(Endpoint, self).handle_exception(exc)
+        except Exception as exc:
+            import sys
+            import traceback
+            sys.stderr.write(traceback.format_exc())
+            event = raven.captureException(request=request)
+            if event:
+                event_id = raven.get_ident(event)
+            else:
+                event_id = None
+            context = {
+                'detail': 'Internal Error',
+                'errorId': event_id,
+            }
+            return Response(context, status=500)
+
+    def create_audit_entry(self, request, **kwargs):
+        user = request.user if request.user.is_authenticated() else None
+        api_key = request.auth if isinstance(request.auth, ApiKey) else None
+
+        AuditLogEntry.objects.create(
+            actor=user,
+            actor_key=api_key,
+            ip_address=request.META['REMOTE_ADDR'],
+            **kwargs
+        )
+
+    @csrf_exempt
+    def dispatch(self, request, *args, **kwargs):
+        """
+        Identical to rest framework's dispatch except we add the ability
+        to convert arguments (for common URL params).
+        """
+        self.args = args
+        self.kwargs = kwargs
+        request = self.initialize_request(request, *args, **kwargs)
+        self.request = request
+        self.headers = self.default_response_headers  # deprecate?
+
+        if settings.SENTRY_API_RESPONSE_DELAY:
+            time.sleep(settings.SENTRY_API_RESPONSE_DELAY / 1000.0)
+
+        origin = request.META.get('HTTP_ORIGIN')
+        if origin and request.auth:
+            allowed_origins = request.auth.get_allowed_origins()
+            if not is_valid_origin(origin, allowed=allowed_origins):
+                response = Response('Invalid origin: %s' % (origin,), status=400)
+                self.response = self.finalize_response(request, response, *args, **kwargs)
+                return self.response
+
+        try:
+            self.initial(request, *args, **kwargs)
+
+            # Get the appropriate handler method
+            if request.method.lower() in self.http_method_names:
+                handler = getattr(self, request.method.lower(),
+                                  self.http_method_not_allowed)
+
+                (args, kwargs) = self.convert_args(request, *args, **kwargs)
+                self.args = args
+                self.kwargs = kwargs
+            else:
+                handler = self.http_method_not_allowed
+
+            response = handler(request, *args, **kwargs)
+
+        except Exception as exc:
+            response = self.handle_exception(request, exc)
+
+        if origin:
+            self.add_cors_headers(request, response)
+
+        self.response = self.finalize_response(request, response, *args, **kwargs)
+
+        return self.response
+
+    def add_cors_headers(self, request, response):
+        response['Access-Control-Allow-Origin'] = request.META['HTTP_ORIGIN']
+        response['Access-Control-Allow-Methods'] = ', '.join(self.http_method_names)
+
+    def paginate(self, request, on_results=None, paginator_cls=Paginator,
+                 default_per_page=100, **kwargs):
+        per_page = int(request.GET.get('per_page', default_per_page))
         input_cursor = request.GET.get('cursor')
-        per_page = int(request.GET.get('per_page', 100))
+        if input_cursor:
+            input_cursor = Cursor.from_string(input_cursor)
+        else:
+            input_cursor = None
 
-        assert per_page <= 100
+        assert per_page <= max(100, default_per_page)
 
-        paginator = Paginator(**kwargs)
+        paginator = paginator_cls(**kwargs)
         cursor_result = paginator.get_result(
             limit=per_page,
             cursor=input_cursor,
         )
 
         # map results based on callback
-        results = on_results(cursor_result.results)
-
-        links = [
-            ('previous', str(cursor_result.prev)),
-            ('next', str(cursor_result.next)),
-        ]
-
-        querystring = u'&'.join(
-            u'{0}={1}'.format(urlquote(k), urlquote(v))
-            for k, v in request.GET.iteritems()
-            if k != 'cursor'
-        )
-        base_url = request.build_absolute_uri(request.path)
-        if querystring:
-            base_url = '{0}?{1}'.format(base_url, querystring)
-        else:
-            base_url = base_url + '?'
-
-        link_values = []
-        for name, cursor in links:
-            link_values.append(LINK_HEADER.format(
-                uri=base_url,
-                cursor=cursor,
-                name=name,
-            ))
+        if on_results:
+            results = on_results(cursor_result.results)
 
         headers = {}
-        if link_values:
-            headers['Link'] = ', '.join(link_values)
+        headers['Link'] = ', '.join([
+            self.build_cursor_link(request, 'previous', cursor_result.prev),
+            self.build_cursor_link(request, 'next', cursor_result.next),
+        ])
 
         return Response(results, headers=headers)
 
 
-class BaseStatsEndpoint(Endpoint):
+class StatsMixin(object):
     def _parse_args(self, request):
         resolution = request.GET.get('resolution')
         if resolution:
             resolution = self._parse_resolution(resolution)
 
-            assert any(r for r in ROLLUPS if r[0] == resolution)
+            assert any(r for r in tsdb.rollups if r[0] == resolution)
 
         end = request.GET.get('until')
         if end:
